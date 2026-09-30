@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.cyoulater.GaugeDeck</id>
+  <name>GaugeDeck</name>
+  <summary>Car-style gauges for your PC's temps, fans and load</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.cyoulater">
+    <name>Miguel Ycaza</name>
+  </developer>
+  <description>
+    <p>
+      GaugeDeck shows your computer's vital signs as a dashboard of car-style dials:
+      CPU temperature and load, GPU temperature and fan, system fans, RAM use and
+      board temperature.
+    </p>
+    <p>
+      Alerts warn you with a notification, an alarm sound and a flashing gauge when
+      a temperature stays too high or a fan stops spinning.
+    </p>
+    <p>
+      It is a native GTK 4 app, so it works on current GNOME Wayland desktops where
+      desktop widgets such as Conky no longer display or can freeze the session.
+      Sensors are detected automatically for Intel and AMD processors and common
+      motherboard chips. It only reads sensor values and changes nothing on the system.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.cyoulater.GaugeDeck.desktop</launchable>
+  <url type="homepage">https://github.com/Cyoulater/gaugedeck</url>
+  <url type="bugtracker">https://github.com/Cyoulater/gaugedeck/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/Cyoulater/gaugedeck/v1.1.1/screenshot.png</image>
+      <caption>Main gauge dashboard</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+  <releases>
+    <release version="1.1.1" date="2026-09-30">
+      <description><p>Test alert also flashes a gauge for 10 seconds.</p></description>
+    </release>
+    <release version="1.1.0" date="2026-09-30">
+      <description><p>Alerts: notification, alarm sound and flashing gauge for high temperatures, high memory use and stopped fans.</p></description>
+    </release>
+    <release version="1.0.2" date="2026-09-30">
+      <description><p>Installer now installs python3-gi-cairo; clearer error if it is missing.</p></description>
+    </release>
+    <release version="1.0.1" date="2026-09-30">
+      <description><p>Fan gauges use the machine's own fan names when available.</p></description>
+    </release>
+    <release version="1.0.0" date="2026-09-30">
+      <description><p>First release.</p></description>
+    </release>
+  </releases>
+</component>

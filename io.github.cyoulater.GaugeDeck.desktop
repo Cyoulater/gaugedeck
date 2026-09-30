@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GaugeDeck
+Comment=Car-style gauges for CPU, GPU, fans, RAM and board temps
+Exec=gaugedeck
+Icon=io.github.cyoulater.GaugeDeck
+Terminal=false
+Categories=System;Monitor;
+Keywords=sensors;temperature;fan;cpu;gpu;monitor;gauge;
+StartupNotify=true
