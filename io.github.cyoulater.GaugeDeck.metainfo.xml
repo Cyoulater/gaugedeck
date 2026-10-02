@@ -40,6 +40,9 @@
     <category>Monitor</category>
   </categories>
   <releases>
+    <release version="1.2.1" date="2026-10-01">
+      <description><p>Temperature and power gauges for an NVIDIA compute card running next to an AMD or Intel display card, with a temperature alert.</p></description>
+    </release>
     <release version="1.1.1" date="2026-09-30">
       <description><p>Test alert also flashes a gauge for 10 seconds.</p></description>
     </release>

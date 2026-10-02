@@ -12,7 +12,7 @@ Built as a native GTK 4 / Wayland app, so it works on current GNOME desktops
 fail to draw.
 
 ## Install
-    ./install.sh                 # or: ./install.sh "MY RIG NAME"   (sets the title shown under the gauges)
+    sh install.sh                # or: sh install.sh "MY RIG NAME"   (sets the title shown under the gauges)
 Then open **GaugeDeck** from your app menu. Right-click it in the dock
 and choose "Pin to Dash" to keep it there. Close it with the X.
 
@@ -42,6 +42,12 @@ Change the limits in `~/.config/gaugedeck/config`:
     board_temp_alert=60
     ram_alert=95
     fan_stop_alert=on
+    nv_temp_alert=85
+
+## NVIDIA compute cards
+If the machine has an NVIDIA card (like a Tesla P100) alongside an AMD or Intel
+display card, GaugeDeck adds a bottom row with that card's temperature and
+power draw (read from `nvidia-smi`). The temperature alerts at `nv_temp_alert`.
 
 ## Sensors
 Detected automatically at startup:
@@ -56,7 +62,7 @@ A gauge shows `--` if that sensor isn't available. For board sensors, run
 Read-only: the app only reads from /sys and /proc. It changes nothing.
 
 ## Uninstall
-    ./uninstall.sh
+    sh uninstall.sh
 
 ## License
 GPL-3.0-or-later. Free to use, share, and modify. If you share a changed

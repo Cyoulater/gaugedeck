@@ -28,11 +28,12 @@ except ImportError:
 from gi.repository import Gtk, GLib, Gio  # noqa: E402
 
 import os
+import re
 import shutil
 import subprocess
 
 APP_NAME = "GaugeDeck"
-VERSION = "1.1.1"
+VERSION = "1.2.1"
 CONFIG_PATH = os.path.expanduser("~/.config/gaugedeck/config")
 
 
@@ -40,7 +41,8 @@ def load_config():
     cfg = {"title": "GAUGEDECK", "scale": "0.6",
            "alerts": "on", "alert_sound": "on", "alert_seconds": "5",
            "cpu_temp_alert": "80", "gpu_temp_alert": "85",
-           "board_temp_alert": "60", "ram_alert": "95", "fan_stop_alert": "on"}
+           "board_temp_alert": "60", "ram_alert": "95", "fan_stop_alert": "on",
+           "nv_temp_alert": "85"}
     try:
         with open(CONFIG_PATH) as f:
             for ln in f:
@@ -72,6 +74,69 @@ GAUGES = [
     (440, 540, 80,  "BOARD",    "°C",  0, 80,   60,   "board_temp", None),
 ]
 BASE_W, BASE_H = 540, 690
+
+
+# --- second card: an NVIDIA card (Tesla, etc.) next to an AMD/Intel display card
+def _nvidia_model():
+    """Short model name of an NVIDIA card, e.g. 'P100'. None if there's no NVIDIA card."""
+    model = ""
+    base = "/proc/driver/nvidia/gpus"
+    try:
+        for card in sorted(os.listdir(base)):
+            with open(os.path.join(base, card, "information")) as f:
+                for ln in f:
+                    if ln.startswith("Model:"):
+                        model = ln.split(":", 1)[1].strip()
+            break
+    except OSError:
+        pass
+    if not model and shutil.which("nvidia-smi"):
+        try:
+            model = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=3).stdout.split("\n")[0].strip()
+        except (OSError, subprocess.SubprocessError):
+            model = ""
+    if not model or "fail" in model.lower() or "error" in model.lower():
+        return None
+    m = re.search(r"\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b", model.replace("-", " "))
+    return m.group(1) if m else "NVIDIA"
+
+
+def _has_display_gpu():
+    return any(n.startswith(p) for n, _ in _hwmons() for p in GPU_CHIPS)
+
+
+def _nvidia_query(fields):
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-gpu=" + fields, "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=2).stdout.split("\n")[0]
+        return [float(x) for x in out.split(",")]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+NV_MODEL = None
+NV_ROW = False
+
+
+def setup_layout():
+    """Add a bottom row for an NVIDIA compute card when the display card is AMD/Intel."""
+    global NV_MODEL, NV_ROW, BASE_H
+    NV_MODEL = _nvidia_model()
+    NV_ROW = bool(NV_MODEL) and _has_display_gpu()
+    if not NV_ROW:
+        return
+    lim = _nvidia_query("power.limit")
+    pmax = int(math.ceil((lim[0] if lim else 300) / 50.0) * 50)
+    red = _num_cfg("nv_temp_alert", 85)
+    GAUGES.append((185, 720, 80, f"{NV_MODEL} TEMP", "°C", 0, 100, red, "nv_temp", None))
+    GAUGES.append((355, 720, 80, f"{NV_MODEL} POWER", "W", 0, pmax, pmax * 0.9, "nv_power", None))
+    ALERT_RULES["nv_temp"] = (red, f"{NV_MODEL} temperature", "°C")
+    BASE_H = 870
 
 C_BG     = (0.05, 0.05, 0.06)
 C_FACE   = (0.09, 0.09, 0.10)
@@ -145,6 +210,7 @@ class Sensors:
         self.gpu = _find(GPU_CHIPS)
         self.board = _find(BOARD_CHIPS)
         self.nvidia = shutil.which("nvidia-smi") if not self.gpu else None
+        self.nv_row = NV_ROW
         self.cpu_temp_file = self._cpu_temp_file()
         self.fans = self._fans()
 
@@ -211,7 +277,10 @@ class Sensors:
         gpu_temp = _num(f"{self.gpu}/temp1_input", 1000) if self.gpu else None
         if gpu_temp is None and self.nvidia:
             gpu_temp = self._nvidia()
+        nv = _nvidia_query("temperature.gpu,power.draw") if self.nv_row else None
         return {
+            "nv_temp":    nv[0] if nv else None,
+            "nv_power":   nv[1] if nv and len(nv) > 1 else None,
             "cpu_temp":   _num(self.cpu_temp_file, 1000) if self.cpu_temp_file else None,
             "board_temp": _num(f"{self.board}/temp1_input", 1000) if self.board else None,
             "fan1":       _num(self.fans[0][0]) if len(self.fans) > 0 else None,
@@ -307,7 +376,7 @@ def draw_all(cr, values, labels=None, alarms=frozenset(), blink=False):
     cr.select_font_face("DejaVu Sans Condensed", 0, 1)
     cr.set_font_size(30)
     cr.set_source_rgb(*C_RED)
-    _centered(cr, TITLE.upper(), BASE_W / 2, 655)
+    _centered(cr, TITLE.upper(), BASE_W / 2, BASE_H - 35)
 
 
 # ---------------------------------------------------------------- alerts
@@ -329,7 +398,9 @@ ALERT_RULES = {
     "board_temp": (_num_cfg("board_temp_alert", 60), "Board temperature", "°C"),
     "ram":        (_num_cfg("ram_alert", 95),        "Memory use",        "%"),
 }
-HYSTERESIS = {"cpu_temp": 5, "gpu_temp": 5, "board_temp": 3, "ram": 5}
+HYSTERESIS = {"cpu_temp": 5, "gpu_temp": 5, "board_temp": 3, "ram": 5, "nv_temp": 5}
+
+setup_layout()
 
 SOUND_CMDS = [
     ["canberra-gtk-play", "-i", "alarm-clock-elapsed"],
@@ -474,4 +545,10 @@ class GaugeApp(Gtk.Application):
 
 
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        print(f"GaugeDeck {VERSION}")
+        print("NVIDIA card:", NV_MODEL or "not found")
+        print("Display card sensor:", "found" if _has_display_gpu() else "not found")
+        print("NVIDIA row:", "ON" if NV_ROW else "off")
+        sys.exit(0)
     sys.exit(GaugeApp().run([a for a in sys.argv if a != "--test-alert"]))
