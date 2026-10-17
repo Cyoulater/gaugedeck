@@ -26,7 +26,7 @@ your app menu.
 | Your Linux | Download |
 |---|---|
 | Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin | [gaugedeck.deb](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.deb) |
-| Fedora, openSUSE | [gaugedeck.rpm](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.rpm) |
+| Fedora | [gaugedeck.rpm](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.rpm) |
 | Anything else | [gaugedeck.tar.gz](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.tar.gz), unpack it, then run `sh install.sh` |
 
 Then open **GaugeDeck** from your app menu. Right-click it in the dock

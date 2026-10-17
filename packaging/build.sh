@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the download files for a release into dist/:
 #   gaugedeck.deb     Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin
-#   gaugedeck.rpm     Fedora, openSUSE (needs rpmbuild)
+#   gaugedeck.rpm     Fedora (needs rpmbuild)
 #   gaugedeck.tar.gz  everything else (unpack, then: sh install.sh)
 # Names carry no version so "releases/latest/download/<name>" links never change.
 set -e
@@ -52,7 +52,7 @@ Summary: Car-style gauges for your PC's temps, fans and load
 License: GPL-3.0-or-later
 URL: https://github.com/Cyoulater/gaugedeck
 BuildArch: noarch
-Requires: python3, python3-gobject, python3-cairo, gtk4
+Requires: python3, python3-gobject, python3-cairo, gobject-introspection, gtk4
 Recommends: lm_sensors
 %description
 GaugeDeck shows CPU and GPU temperature, load, fan speeds, RAM use and

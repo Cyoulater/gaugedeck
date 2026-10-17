@@ -15,7 +15,7 @@ gtk_ok() {
 if ! gtk_ok; then
     echo "Installing GTK 4 and Python support (asks for your password)..."
     if has apt-get; then sudo apt-get install -y python3-gi python3-gi-cairo gir1.2-gtk-4.0
-    elif has dnf; then sudo dnf install -y python3-gobject python3-cairo gtk4
+    elif has dnf; then sudo dnf install -y python3-gobject python3-cairo gobject-introspection gtk4
     elif has pacman; then sudo pacman -S --needed --noconfirm python-gobject python-cairo gtk4
     elif has zypper; then sudo zypper --non-interactive install python3-gobject python3-gobject-cairo typelib-1_0-Gtk-4_0
     else
