@@ -21,8 +21,11 @@
     <p>
       It is a native GTK 4 app, so it works on current GNOME Wayland desktops where
       desktop widgets such as Conky no longer display or can freeze the session.
-      Sensors are detected automatically for Intel and AMD processors and common
-      motherboard chips. It only reads sensor values and changes nothing on the system.
+      Every sensor the computer reports is found and named automatically: processors,
+      graphics cards (including NVIDIA compute cards), drives, motherboard chips and fans.
+      Any of them can be shown as a gauge. Gauges can be restyled with colors, glow, shapes
+      and your own pictures, moved into their own windows, pinned to the dock, or shown as a
+      slim strip. Sensors are only read; nothing on the system is changed.
     </p>
   </description>
   <launchable type="desktop-id">io.github.cyoulater.GaugeDeck.desktop</launchable>
@@ -40,6 +43,13 @@
     <category>Monitor</category>
   </categories>
   <releases>
+    <release version="1.3.0" date="2026-10-17">
+      <description>
+        <p>Customize window: colors, shapes, glow and pictures, with ready-made looks. New gauge styles: ring, bar, digital and graph.</p>
+        <p>Every sensor on the computer is found and named, with a Sensors window to choose which ones to show.</p>
+        <p>Pop any gauge out into its own window, pin it to the dock, or use the compact strip. Sensors are read in the background so the window never freezes. The installer no longer erases other settings when a title is given.</p>
+      </description>
+    </release>
     <release version="1.2.1" date="2026-10-01">
       <description><p>Temperature and power gauges for an NVIDIA compute card running next to an AMD or Intel display card, with a temperature alert.</p></description>
     </release>
