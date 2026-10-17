@@ -1,4 +1,4 @@
-"""Tests for the parts of GaugeDeck that need no screen: layout, looks, alerts, launchers.
+"""Tests for the parts of GaugeDeck that need no screen: sensors, layout, looks, alerts, launchers.
 Run with:  python3 -m unittest discover -s tests -v"""
 import importlib.util
 import os
@@ -7,13 +7,146 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, os.path.dirname(__file__))
+import fake_machine  # noqa: E402
+
 _TMP = tempfile.mkdtemp(prefix="gaugedeck-test-")
 os.environ["GAUGEDECK_CONFIG_DIR"] = _TMP
+_MACHINES = {}
+for _kind in fake_machine.MACHINES:
+    _MACHINES[_kind] = os.path.join(_TMP, "machine-" + _kind)
+    fake_machine.MACHINES[_kind](_MACHINES[_kind])
+_PATH = os.environ.get("PATH", "")
+
+
+def use_machine(kind):
+    """Point GaugeDeck (and its nvidia-smi) at one of the fake computers."""
+    os.environ["GAUGEDECK_ROOT"] = _MACHINES[kind]
+    os.environ["PATH"] = os.path.join(_MACHINES[kind], "bin") + os.pathsep + _PATH
+    if "gd" in globals():
+        gd.ROOT = _MACHINES[kind]
+
+
+use_machine("desktop")      # the module finds its gauges when it's loaded
 sys.argv = ["gaugedeck"]
 _spec = importlib.util.spec_from_file_location(
     "gaugedeck", os.path.join(os.path.dirname(__file__), "..", "gaugedeck.py"))
 gd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gd)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def tearDown(self):
+        use_machine("desktop")
+
+    def found(self, kind):
+        use_machine(kind)
+        return {g["key"]: g for g in gd.Finder().run()}
+
+    def test_desktop_sensors_get_their_real_names(self):
+        g = self.found("desktop")
+        self.assertEqual(g["cpu_temp"]["name"], "AMD Ryzen 9 5900X (k10temp)")
+        self.assertTrue(g["cpu_temp"]["where"].endswith("temp1_input"))      # Tctl, not a CCD
+        self.assertEqual(g["gpu_temp"]["label"], "RX 6600 TEMP")
+        self.assertIn("Radeon RX 6600", g["gpu_temp"]["name"])
+        self.assertEqual((g["nv_temp"]["label"], g["nv_power"]["label"]), ("P100 TEMP", "P100 POWER"))
+        self.assertIn("compute card", g["nv_temp"]["name"])
+        self.assertEqual(g["nv_power"]["max"], 250)              # from the card's power limit
+        self.assertNotIn("nv_fan", g)                            # a Tesla has no fan of its own
+        self.assertEqual(g["nvme0_temp"]["label"], "980 PRO TEMP")
+        self.assertEqual(g["sda_temp"]["name"], "WDC WDS500G2B0A (sda)")
+        self.assertEqual(g["board_temp"]["name"], "ASUSTeK ROG STRIX B550-F GAMING (Nuvoton NCT6798)")
+        self.assertEqual(g["gpu_power"]["max"], 150)             # 130 W cap, rounded up
+
+    def test_only_spinning_fans_and_sane_readings_are_kept(self):
+        g = self.found("desktop")
+        self.assertEqual([k for k in g if k.startswith("fan")], ["fan1", "fan2", "fan3"])
+        self.assertTrue(g["fan1"]["where"].endswith("fan2_input"))       # header 1 is empty
+        self.assertNotIn("board_auxtin0", g)                              # -62 °C is a dead input
+        self.assertIn("gpu_fan", g)                # a GPU fan resting at 0 RPM is still a fan
+
+    def test_the_deck_starts_with_the_main_sensors_only(self):
+        g = self.found("desktop")
+        on = [k for k, v in g.items() if v["on"]]
+        self.assertEqual(on[:8], ["cpu_temp", "cpu_load", "gpu_temp", "fan1", "fan2", "gpu_fan", "ram", "board_temp"])
+        for extra in ("cpu_tccd1", "gpu_junction", "nvme0_sensor_1", "dimm1_temp", "wifi_temp"):
+            self.assertFalse(g[extra]["on"], extra)
+
+    def test_laptop(self):
+        g = self.found("laptop")
+        self.assertEqual(g["cpu_temp"]["name"], "12th Gen Intel Core i7-1260P (coretemp)")
+        self.assertEqual(g["cpu_core_1"]["label"], "CPU CORE 1")
+        self.assertEqual(g["fan1"]["max"], 6000)                 # laptop fans spin faster
+        self.assertNotIn("board_temp", g)          # the ThinkPad's temp1 is not a board sensor
+        self.assertIn("cpu_power", g)
+        self.assertIn("acpi_temp", g)
+
+    def test_server_with_two_compute_cards(self):
+        g = self.found("server")
+        self.assertEqual(g["nv_temp"]["label"], "P100 1 TEMP")
+        self.assertEqual(g["nv2_temp"]["label"], "P100 2 TEMP")
+        self.assertNotIn("gpu_temp", g)              # no display card: nothing pretends to be one
+
+    def test_bare_machine(self):
+        self.assertEqual(sorted(self.found("bare")), ["cpu_load", "ram"])
+
+    def test_keys_are_unique_and_valid_app_ids(self):
+        for kind in fake_machine.MACHINES:
+            gauges = list(self.found(kind).values())
+            self.assertEqual(len({g["key"] for g in gauges}), len(gauges))
+            for g in gauges:
+                self.assertTrue(gd.Gio.Application.id_is_valid(f"{gd.APP_ID}.{g['key']}"), g["key"])
+
+    def test_names_are_shortened_sensibly(self):
+        self.assertEqual(gd._short_gpu("NVIDIA GeForce RTX 3080"), "RTX 3080")
+        self.assertEqual(gd._short_gpu("NVIDIA A100-SXM4-40GB"), "A100")
+        self.assertEqual(gd._short_gpu("AlderLake-S GT1 [UHD Graphics 770]"), "UHD 770")
+        self.assertEqual(gd._short_drive("CT1000P5SSD8"), "CT1000P5SSD8")
+        self.assertEqual(gd._short_drive("Samsung SSD 870 EVO 500GB"), "870 EVO")
+
+
+class ReadingTests(unittest.TestCase):
+    def test_every_found_sensor_reads(self):
+        vals = gd.Sensors().read_all()
+        self.assertAlmostEqual(vals["cpu_temp"], 48.25)
+        self.assertEqual(vals["fan2"], 850)
+        self.assertEqual(vals["nv_temp"], 38)
+        self.assertAlmostEqual(vals["nv_power"], 26.51)
+        self.assertEqual(vals["gpu_power"], 15)
+        self.assertAlmostEqual(vals["ram"], 25)
+
+    def test_only_wanted_sensors_are_read(self):
+        vals = gd.Sensors().read_all({"ram"})
+        self.assertIsNone(vals["cpu_temp"])
+        self.assertIsNotNone(vals["ram"])
+
+    def test_energy_counter_becomes_watts(self):
+        use_machine("laptop")
+        try:
+            f = os.path.join(gd.ROOT, "sys/class/powercap/intel-rapl:0/energy_uj")
+            s = gd.Sensors()
+            self.assertIsNone(s.energy(f, f))
+            e, t = s._energy[f]
+            s._energy[f] = (e - 10e6, t - 1.0)          # 10 J over a second
+            self.assertAlmostEqual(s.energy(f, f), 10, delta=0.5)
+        finally:
+            use_machine("desktop")
+
+    def test_unsupported_nvidia_fields_read_as_missing(self):
+        self.assertIsNone(gd.Sensors.nvidia()[0]["fan.speed"])
+
+    def test_show_and_hide(self):
+        gd.CFG.update(show="cpu_tccd1", hide="fan3")
+        try:
+            gd.setup_layout()
+            keys = [g["key"] for g in gd.GAUGES]
+            self.assertIn("cpu_tccd1", keys)
+            self.assertNotIn("fan3", keys)
+            self.assertIsNotNone(gd.gauge_by_key("fan3"))       # still there for --gauge fan3
+        finally:
+            gd.CFG.pop("show")
+            gd.CFG.pop("hide")
+            gd.setup_layout()
 
 
 class LayoutTests(unittest.TestCase):
@@ -135,6 +268,14 @@ class DrawingTests(unittest.TestCase):
                         gd.draw_gauge(cairo.Context(surf), 60, 60, 50, gauge, v, theme.look(None),
                                       None, True, True, hist)
 
+    def test_every_found_sensor_draws_in_the_deck(self):
+        import cairo
+        theme = gd.Theme(os.path.join(_TMP, "deck.json"))
+        placed, bh = gd.deck_layout(gd.ALL_GAUGES)
+        vals = gd.Sensors().read_all()
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 540, int(bh))
+        gd.draw_deck(cairo.Context(surf), 540, bh, placed, bh, vals, {}, theme, set(), False, "T")
+
     def test_a_missing_or_broken_picture_is_ignored(self):
         self.assertIsNone(gd.PICTURES.get(""))
         self.assertIsNone(gd.PICTURES.get("/no/such/picture.png"))
@@ -187,6 +328,19 @@ class AlertTests(unittest.TestCase):
         self.feed(cpu_temp=60)
         self.assertEqual(self.sent[-1][1], "Back to normal")
         self.assertNotIn("cpu_temp", self.alerts.active)
+
+    def test_alerts_name_the_device(self):
+        self.assertEqual(gd.ALERT_RULES["gpu_temp"][1], "RX 6600 temperature")
+        self.assertEqual(gd.ALERT_RULES["nv_temp"][1], "P100 temperature")
+        self.assertEqual(gd.ALERT_RULES["board_temp"][1:], ("Board temperature", "°C", 3))
+        self.assertEqual(gd.ALERT_RULES["ram"][1], "Memory use")
+
+    def test_every_spinning_fan_is_watched(self):
+        self.shown = {"fan3"}
+        self.feed(fan3=900)
+        for _ in range(4):
+            self.feed(fan3=0)
+        self.assertEqual(self.sent[0][1], "FAN3 stopped")
 
     def test_a_fan_that_never_spun_does_not_alarm(self):
         for _ in range(5):

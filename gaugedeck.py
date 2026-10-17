@@ -12,7 +12,8 @@ GaugeDeck - car-style sensor dials as a normal GTK4 app window.
 Native Wayland (no X11 / XWayland), so it can't hang the desktop the way
 Conky did. Open it from the dock icon, close it with the X.
 
-Sensors are read straight from /sys/class/hwmon and /proc. Reading never
+Sensors are found at startup and read straight from /sys/class/hwmon,
+/sys/class/powercap, /proc and nvidia-smi; `gaugedeck --check` lists them. Reading never
 writes anything to the system. GaugeDeck writes only its own files:
 ~/.config/gaugedeck/ (settings, look, window state) and, when you pin a gauge
 to the dock, a launcher in ~/.local/share/applications/.
@@ -96,131 +97,43 @@ except ValueError:
 TITLE = CFG["title"][:24]
 
 
-def _gauge(key, label, unit, vmin, vmax, red, scale=None, big=False):
-    return {"key": key, "label": label, "unit": unit, "min": vmin, "max": vmax,
-            "red": red, "scale": scale, "big": big}
+def _gauge(key, label, unit, vmin, vmax, red, scale=None, big=False, **info):
+    g = {"key": key, "label": label, "unit": unit, "min": vmin, "max": vmax,
+         "red": red, "scale": scale, "big": big}
+    g.update(info)
+    return g
 
 
-# The red zone of a temperature or RAM gauge starts where its alert goes off.
-GAUGES = [
-    _gauge("cpu_temp",   "CPU TEMP", "°C",  0, 100,  _num_cfg("cpu_temp_alert", 80), big=True),
-    _gauge("cpu_load",   "CPU LOAD", "%",   0, 100,  90, big=True),
-    _gauge("gpu_temp",   "GPU TEMP", "°C",  0, 100,  _num_cfg("gpu_temp_alert", 85)),
-    _gauge("fan1",       "FAN 1",    "RPM", 0, 2500, 2200, scale=1000),
-    _gauge("fan2",       "FAN 2",    "RPM", 0, 2500, 2200, scale=1000),
-    _gauge("gpu_fan",    "GPU FAN",  "RPM", 0, 3500, 3000, scale=1000),
-    _gauge("ram",        "RAM",      "%",   0, 100,  _num_cfg("ram_alert", 95)),
-    _gauge("board_temp", "BOARD",    "°C",  0, 80,   _num_cfg("board_temp_alert", 60)),
-]
-SOURCES = ("cpu_temp", "cpu_load", "gpu_temp", "fan1", "fan2", "gpu_fan",
-           "ram", "board_temp", "nv_temp", "nv_power")
+# Every sensor GaugeDeck found. GAUGES is the part of it shown in the deck and
+# the strip; any other one can still be opened with --gauge KEY.
+ALL_GAUGES = []
+GAUGES = []
 
 
 def gauge_by_key(key):
-    for g in GAUGES:
+    for g in ALL_GAUGES:
         if g["key"] == key:
             return g
     return None
 
 
-# --- second card: an NVIDIA card (Tesla, etc.) next to an AMD/Intel display card
-def _nvidia_model():
-    """Short model name of an NVIDIA card, e.g. 'P100'. None if there's no NVIDIA card."""
-    if DEMO:
-        return "P100"
-    model = ""
-    base = "/proc/driver/nvidia/gpus"
-    try:
-        for card in sorted(os.listdir(base)):
-            with open(os.path.join(base, card, "information")) as f:
-                for ln in f:
-                    if ln.startswith("Model:"):
-                        model = ln.split(":", 1)[1].strip()
-            break
-    except OSError:
-        pass
-    if not model and shutil.which("nvidia-smi"):
-        try:
-            model = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=3).stdout.split("\n")[0].strip()
-        except (OSError, subprocess.SubprocessError):
-            model = ""
-    if not model or "fail" in model.lower() or "error" in model.lower():
-        return None
-    m = re.search(r"\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b", model.replace("-", " "))
-    return m.group(1) if m else "NVIDIA"
-
-
-def _has_display_gpu():
-    return any(n.startswith(p) for n, _ in _hwmons() for p in GPU_CHIPS)
-
-
-def _nvidia_query(fields):
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
-    try:
-        out = subprocess.run([exe, "--query-gpu=" + fields, "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=2).stdout.split("\n")[0]
-        return [float(x) for x in out.split(",")]
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-
-
-NV_MODEL = None
-NV_ROW = False
-NV_POWER_MAX = 300
-
-
-def setup_layout():
-    """Add gauges for an NVIDIA compute card when the display card is AMD/Intel."""
-    global NV_MODEL, NV_ROW, NV_POWER_MAX
-    NV_MODEL = _nvidia_model()
-    NV_ROW = bool(NV_MODEL) and (DEMO or _has_display_gpu())
-    if not NV_ROW:
-        return
-    lim = None if DEMO else _nvidia_query("power.limit")
-    NV_POWER_MAX = int(math.ceil((lim[0] if lim else 300) / 50.0) * 50)
-    red = _num_cfg("nv_temp_alert", 85)
-    GAUGES.append(_gauge("nv_temp", f"{NV_MODEL} TEMP", "°C", 0, 100, red))
-    GAUGES.append(_gauge("nv_power", f"{NV_MODEL} POWER", "W", 0, NV_POWER_MAX, NV_POWER_MAX * 0.9))
-    ALERT_RULES["nv_temp"] = (red, f"{NV_MODEL} temperature", "°C")
-
-
 # ---------------------------------------------------------------- sensors
+# Discovery: every temperature, fan, power and load sensor the machine has,
+# from /sys/class/hwmon, /sys/class/powercap, /proc and nvidia-smi, named
+# after the real device. GAUGEDECK_ROOT points it at a fake machine in the tests.
+ROOT = os.environ.get("GAUGEDECK_ROOT", "")
+
+
+def _p(path):
+    return ROOT + path
+
+
 def _read(path):
     try:
-        with open(path) as f:
+        with open(path, errors="replace") as f:
             return f.readline().strip()
     except OSError:
         return None
-
-
-CPU_CHIPS   = ["coretemp", "k10temp", "zenpower", "cpu_thermal"]
-GPU_CHIPS   = ["amdgpu", "nouveau", "radeon", "i915", "xe"]
-BOARD_CHIPS = ["nct", "it87", "it86", "f71", "w83", "asus", "gigabyte", "dell_smm", "thinkpad", "hp"]
-
-
-def _hwmons():
-    base = "/sys/class/hwmon"
-    try:
-        entries = sorted(os.listdir(base))
-    except OSError:
-        return []
-    out = []
-    for e in entries:
-        path = os.path.join(base, e)
-        out.append((_read(path + "/name") or "", path))
-    return out
-
-
-def _find(prefixes):
-    for pref in prefixes:
-        for name, path in _hwmons():
-            if name.startswith(pref):
-                return path
-    return None
 
 
 def _num(path, div=1):
@@ -229,6 +142,451 @@ def _num(path, div=1):
         return float(v) / div
     except (TypeError, ValueError):
         return None
+
+
+def _natural(s):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+
+
+def _slug(text):
+    s = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
+    return s or "x"
+
+
+CPU_CHIPS    = ["coretemp", "k10temp", "zenpower", "cpu_thermal", "cpu-thermal", "soc_thermal"]
+GPU_CHIPS    = ["amdgpu", "nouveau", "radeon", "i915", "xe"]
+DRIVE_CHIPS  = ["nvme", "drivetemp"]
+BOARD_CHIPS  = ["nct", "it87", "it86", "f71", "w83", "asus", "gigabyte", "dell_smm", "thinkpad", "hp",
+                "applesmc", "lenovo", "msi"]
+LAPTOP_CHIPS = ["dell_smm", "thinkpad", "hp", "applesmc", "lenovo", "asus"]
+OTHER_CHIPS  = [("spd5118", "memory", "DIMM"), ("jc42", "memory", "DIMM"), ("pch_", "chipset", "CHIPSET"),
+                ("iwlwifi", "wifi", "WIFI"), ("mt7", "wifi", "WIFI"), ("ath", "wifi", "WIFI"),
+                ("rtw", "wifi", "WIFI"), ("acpitz", "acpi", "ACPI"), ("BAT", "battery", "BATTERY"),
+                ("r8169", "network", "NIC"), ("igc", "network", "NIC"), ("ucsi", "usb", "USB-C")]
+CHIP_MAKERS  = [("nct", "Nuvoton"), ("it8", "ITE"), ("f71", "Fintek"), ("w83", "Winbond"),
+                ("dell_smm", "Dell"), ("thinkpad", "ThinkPad"), ("asus", "ASUS"), ("gigabyte", "Gigabyte"),
+                ("hp", "HP"), ("applesmc", "Apple SMC"), ("k10temp", "AMD"), ("zenpower", "AMD"),
+                ("coretemp", "Intel"), ("spd5118", "DDR5 SPD"), ("jc42", "DDR4 SPD"), ("iwlwifi", "Intel Wi-Fi"),
+                ("acpitz", "ACPI thermal zone"), ("pch_", "Intel PCH"), ("mt7", "MediaTek Wi-Fi"),
+                ("ath", "Qualcomm Atheros Wi-Fi"), ("rtw", "Realtek Wi-Fi"), ("r8169", "Realtek network"),
+                ("igc", "Intel network"), ("ucsi", "USB-C"), ("lenovo", "Lenovo"), ("msi", "MSI")]
+VENDORS      = {"0x1002": "AMD", "0x8086": "Intel", "0x10de": "NVIDIA", "0x1a03": "ASPEED", "0x102b": "Matrox"}
+PCI_IDS      = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids")
+PCI_ADDR     = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$")
+CHANNEL      = re.compile(r"^(temp|fan|power)(\d+)_(input|average)$")
+GPU_NOISE    = {"NVIDIA", "AMD", "ATI", "INTEL", "RADEON", "GEFORCE", "TESLA", "QUADRO", "GRAPHICS",
+                "CORPORATION", "PCIE", "(R)", "(TM)"}
+DRIVE_NOISE  = {"SAMSUNG", "SSD", "WDC", "WD", "CRUCIAL", "KINGSTON", "INTEL", "SEAGATE", "TOSHIBA",
+                "NVME", "SK", "HYNIX", "SABRENT", "ADATA", "TEAM", "HDD", "M.2", "WESTERN", "DIGITAL"}
+NV_FIELDS    = ("temperature.gpu", "power.draw", "fan.speed", "utilization.gpu")
+
+
+def _hwmons():
+    base = _p("/sys/class/hwmon")
+    try:
+        entries = sorted(os.listdir(base), key=_natural)
+    except OSError:
+        return []
+    return [(_read(os.path.join(base, e, "name")) or "", os.path.join(base, e)) for e in entries]
+
+
+def _pci_name(vendor, device):
+    """The device's name from the pci.ids list (the one lspci uses), or None."""
+    v, d = (vendor or "").lower()[-4:], (device or "").lower()[-4:]
+    if len(v) != 4 or len(d) != 4:
+        return None
+    for path in PCI_IDS:
+        try:
+            with open(_p(path), errors="replace") as f:
+                in_vendor = False
+                for ln in f:
+                    if ln.startswith("#") or not ln.strip():
+                        continue
+                    if not ln.startswith("\t"):
+                        if ln.startswith("C "):
+                            break
+                        in_vendor = ln[:4].lower() == v
+                    elif in_vendor and not ln.startswith("\t\t") and ln[1:5].lower() == d:
+                        return ln[5:].strip()
+        except OSError:
+            continue
+    return None
+
+
+def _pci_dir(addr):
+    return _p(f"/sys/bus/pci/devices/{addr}")
+
+
+def _short_gpu(name):
+    """'Navi 23 [Radeon RX 6600/6600 XT]' -> 'RX 6600', 'Tesla P100-PCIE-16GB' -> 'P100'."""
+    m = re.search(r"\[([^\]]+)\]", name or "")
+    s = (m.group(1) if m else name or "").split("/")[0]
+    s = re.sub(r"\((R|TM)\)", " ", s, flags=re.I).replace("-", " ")
+    words = [w for w in s.split() if w.upper() not in GPU_NOISE
+             and not re.fullmatch(r"\d+GB|SXM\d*|PCIE|SMX\d*", w, re.I)]
+    return " ".join(words)[:12].strip() or None
+
+
+def _short_drive(model):
+    """'Samsung SSD 980 PRO 1TB' -> '980 PRO'."""
+    words = [w for w in (model or "").replace("_", " ").split() if w.upper() not in DRIVE_NOISE
+             and not re.fullmatch(r"\d+(\.\d+)?(GB|TB|G|T)", w, re.I)]
+    return " ".join(words[:2])[:12].strip() or None
+
+
+def _cpu_name():
+    info = {}
+    try:
+        with open(_p("/proc/cpuinfo"), errors="replace") as f:
+            for ln in f:
+                if ":" in ln:
+                    k, v = ln.split(":", 1)
+                    info.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    name = info.get("model name") or info.get("Model") or info.get("Hardware") \
+        or (_read(_p("/sys/firmware/devicetree/base/model")) or "").strip("\x00")
+    name = re.sub(r"\((R|TM)\)|\bCPU\b|@.*$|\b\d+-Core Processor\b|\bProcessor\b", " ", name or "")
+    return " ".join(name.split()) or "CPU"
+
+
+def _board_name():
+    vendor = _read(_p("/sys/class/dmi/id/board_vendor")) or ""
+    board = _read(_p("/sys/class/dmi/id/board_name")) or ""
+    vendor = re.sub(r"\b(COMPUTER|INC|CO|LTD|CORPORATION|TECHNOLOGY)\b\.?|,", "", vendor, flags=re.I)
+    return " ".join((vendor + " " + board).split())
+
+
+def _chip_name(chip):
+    for pref, maker in CHIP_MAKERS:
+        if chip.startswith(pref):
+            return f"{maker} {chip.upper()}" if pref in ("nct", "it8", "f71", "w83") else maker
+    return chip
+
+
+def _channels(path):
+    """{('temp', 1): (file, label), ...} for every reading this hwmon chip has."""
+    found = {}
+    try:
+        files = sorted(os.listdir(path), key=_natural)
+    except OSError:
+        return found
+    for fn in files:
+        m = CHANNEL.match(fn)
+        if not m:
+            continue
+        kind, n, how = m.group(1), int(m.group(2)), m.group(3)
+        if (kind, n) in found and how == "average":
+            continue                        # prefer power1_input over power1_average
+        found[(kind, n)] = (os.path.join(path, fn), _read(os.path.join(path, f"{kind}{n}_label")))
+    return dict(sorted(found.items(), key=lambda kv: (kv[0][0], kv[0][1])))
+
+
+def _valid_temp(v):
+    return v is not None and -30 < v < 126
+
+
+def _round_up(v, step=50):
+    return int(math.ceil(max(v, step) / float(step)) * step)
+
+
+class Finder:
+    """Walks the machine once and makes a gauge for every sensor it finds."""
+
+    def __init__(self):
+        self.out = []
+        self.keys = set()
+
+    def key(self, want):
+        key, n = want, 2
+        while key in self.keys:
+            key, n = f"{want}_{n}", n + 1
+        self.keys.add(key)
+        return key
+
+    def add(self, key, label, kind, unit, vmin, vmax, red, src, device, name, where,
+            on=False, group=9, alert=None, scale=None, big=False, hyst=5):
+        self.out.append(_gauge(self.key(key), label, unit, vmin, vmax, red, scale=scale, big=big,
+                               kind=kind, src=src, device=device, name=name, where=where,
+                               on=on, group=group, alert=alert, hyst=hyst))
+
+    def temp(self, key, label, f, device, name, limit, on=False, group=9, big=False, vmax=100, hyst=5):
+        self.add(key, label, "temp", "°C", 0, vmax, limit, ("file", f, 1000), device, name, f,
+                 on=on, group=group, alert=limit, big=big, hyst=hyst)
+
+    # --- the parts of the machine
+    def run(self):
+        chips = []
+        for chip, path in _hwmons():
+            dev = os.path.realpath(path + "/device") if os.path.exists(path + "/device") else ""
+            chips.append((chip, path, dev, _channels(path)))
+        self.cpus([c for c in chips if any(c[0].startswith(p) for p in CPU_CHIPS)])
+        self.gpus([c for c in chips if any(c[0].startswith(p) for p in GPU_CHIPS)])
+        self.ram()
+        self.boards([c for c in chips if any(c[0].startswith(p) for p in BOARD_CHIPS)])
+        self.drives([c for c in chips if c[0] in DRIVE_CHIPS])
+        known = CPU_CHIPS + GPU_CHIPS + DRIVE_CHIPS + BOARD_CHIPS
+        self.others([c for c in chips if not any(c[0].startswith(p) for p in known)])
+        return sorted(self.out, key=lambda g: g["group"])     # stable: keeps the order found
+
+    def cpus(self, chips):
+        name = _cpu_name()
+        limit = _num_cfg("cpu_temp_alert", 80)
+        if not chips:
+            chips = self._thermal_zone_cpu()
+        for i, (chip, path, _dev, ch) in enumerate(chips):
+            pre, tag = ("cpu", "CPU") if i == 0 else (f"cpu{i + 1}", f"CPU {i + 1}")
+            where = f"{name} ({chip})"
+            temps = [(n, f, lab) for (k, n), (f, lab) in ch.items() if k == "temp" and _valid_temp(_num(f, 1000))]
+            main = None
+            for want in ("Package", "Tdie", "Tctl"):
+                main = main or next((t for t in temps if t[2] and want in t[2]), None)
+            main = main or (temps[0] if temps else None)
+            for t in temps:
+                if t is main:
+                    self.temp(f"{pre}_temp", f"{tag} TEMP", t[1], "cpu", where, limit,
+                              on=True, group=0, big=i == 0)
+                else:
+                    lab = (t[2] or f"temp {t[0]}").upper().replace("PACKAGE ID", "PACKAGE")
+                    self.temp(f"{pre}_{_slug(t[2] or 'temp' + str(t[0]))}", f"{tag} {lab}"[:16],
+                              t[1], "cpu", where, limit)
+            for (k, n), (f, lab) in ch.items():
+                if k == "power" and _num(f) is not None:
+                    self.add(f"{pre}_power" if n == 1 else f"{pre}_{_slug(lab or 'power' + str(n))}",
+                             f"{tag} POWER", "power", "W", 0, 200, 180, ("file", f, 1e6), "cpu",
+                             where, f, on=n == 1, group=3)
+        self.add("cpu_load", "CPU LOAD", "load", "%", 0, 100, 90, ("cpu_load",), "cpu",
+                 name, "/proc/stat", on=True, group=0, big=True)
+        if "cpu_power" not in self.keys:
+            self._rapl(name)
+
+    def _thermal_zone_cpu(self):
+        """No CPU hwmon chip (some ARM boards, VMs): use the kernel's CPU thermal zone."""
+        base = _p("/sys/class/thermal")
+        try:
+            zones = sorted(os.listdir(base), key=_natural)
+        except OSError:
+            return []
+        for z in zones:
+            kind = _read(os.path.join(base, z, "type")) or ""
+            f = os.path.join(base, z, "temp")
+            if kind in ("x86_pkg_temp", "cpu-thermal", "cpu_thermal", "soc_thermal", "cpu0-thermal") \
+                    and _valid_temp(_num(f, 1000)):
+                return [(kind, os.path.join(base, z), "", {("temp", 1): (f, None)})]
+        return []
+
+    def _rapl(self, name):
+        """Whole-package CPU power from Intel/AMD RAPL, when the system lets users read it."""
+        d = _p("/sys/class/powercap/intel-rapl:0")
+        f = d + "/energy_uj"
+        if _num(f) is None:
+            return
+        lim = _num(d + "/constraint_0_power_limit_uw", 1e6)
+        top = _round_up(lim * 1.25 if lim else 200)
+        self.add("cpu_power", "CPU POWER", "power", "W", 0, top, top * 0.9,
+                 ("energy", f, d + "/max_energy_range_uj"), "cpu", name, f, on=True, group=3)
+
+    def gpus(self, chips):
+        cards = []
+        for chip, path, dev, ch in chips:
+            addr = os.path.basename(dev) if PCI_ADDR.match(os.path.basename(dev)) else None
+            pname = _read(dev + "/product_name") if dev else None
+            vendor = _read(dev + "/vendor") if dev else None
+            if not pname and dev:
+                pname = _pci_name(vendor, _read(dev + "/device"))
+            maker = VENDORS.get(vendor or "", "")
+            m = re.match(r"^(.*?)\s*\[([^\]]+)\]$", pname or "")
+            nice = f"{m.group(2)} ({m.group(1)})" if m and m.group(1) else (m.group(2) if m else pname)
+            full = f"{maker} {nice}".strip() if pname else f"{maker or chip} GPU"
+            cards.append({"addr": addr, "name": full, "short": _short_gpu(pname) if pname else None,
+                          "chip": chip, "path": path, "dev": dev, "ch": ch, "nv": None})
+        cards += self._nvidia_cards(cards)
+        for c in cards:
+            pdir = _pci_dir(c["addr"]) if c["addr"] else c["dev"]
+            c["compute"] = (_read(pdir + "/class") or "").startswith("0x0302")
+            c["boot"] = _read(pdir + "/boot_vga") == "1"
+        primary = next((c for c in cards if c["boot"]), None) \
+            or next((c for c in cards if not c["compute"] and c["nv"] is None), None) \
+            or next((c for c in cards if not c["compute"]), None)
+        shorts = [c["short"] for c in cards]
+        seen = {}
+        for c in cards:          # two of the same card: P100 1, P100 2
+            if c["short"] and shorts.count(c["short"]) > 1:
+                seen[c["short"]] = seen.get(c["short"], 0) + 1
+                c["short"] = f"{c['short']} {seen[c['short']]}"
+        n_other = n_nv = 0
+        for c in [primary] + [c for c in cards if c is not primary] if primary else cards:
+            if c is primary:
+                pre, group = "gpu", 1
+            elif c["nv"] is not None:
+                n_nv += 1
+                pre, group = ("nv" if n_nv == 1 else f"nv{n_nv}"), 5
+            else:
+                n_other += 1
+                pre, group = f"gpu{n_other + 1}", 5
+            tag = c["short"] or ("GPU" if pre == "gpu" else pre.upper())
+            kind = "compute card" if c["compute"] else "graphics card"
+            where = f"{c['name']} ({kind})"
+            limit = _num_cfg("nv_temp_alert" if pre.startswith("nv") else "gpu_temp_alert", 85)
+            if c["nv"] is not None:
+                self._nvidia_gauges(c, pre, tag, where, limit, group)
+            else:
+                self._hwmon_gpu_gauges(c, pre, tag, where, limit, group)
+
+    def _hwmon_gpu_gauges(self, c, pre, tag, where, limit, group):
+        temps = [(n, f, lab) for (k, n), (f, lab) in c["ch"].items() if k == "temp" and _valid_temp(_num(f, 1000))]
+        names = {"edge": None, "junction": "HOT SPOT", "mem": "VRAM"}
+        for i, (n, f, lab) in enumerate(temps):
+            extra = names.get((lab or "").lower(), (lab or f"TEMP {n}").upper())
+            if i == 0:
+                self.temp(f"{pre}_temp", f"{tag} TEMP", f, "gpu", where, limit, on=True, group=group)
+            else:
+                self.temp(f"{pre}_{_slug(lab or 'temp' + str(n))}", f"{tag} {extra}", f, "gpu", where, limit)
+        fan = c["ch"].get(("fan", 1))
+        if fan and _num(fan[0]) is not None:
+            top = _round_up(_num(c["path"] + "/fan1_max") or 3500, 500)
+            self.add(f"{pre}_fan", f"{tag} FAN", "fan", "RPM", 0, top, top * 0.86, ("file", fan[0], 1),
+                     "gpu", where, fan[0], on=True, group=group + (1 if pre == "gpu" else 0), scale=1000)
+        power = c["ch"].get(("power", 1))
+        if power and _num(power[0]) is not None:
+            cap = _num(c["path"] + "/power1_cap_max", 1e6) or _num(c["path"] + "/power1_cap", 1e6)
+            top = _round_up(cap or 300)
+            self.add(f"{pre}_power", f"{tag} POWER", "power", "W", 0, top, top * 0.9,
+                     ("file", power[0], 1e6), "gpu", where, power[0], on=True, group=group + 2)
+        busy = c["dev"] + "/gpu_busy_percent" if c["dev"] else None
+        if busy and _num(busy) is not None:
+            self.add(f"{pre}_load", f"{tag} LOAD", "load", "%", 0, 100, 95, ("file", busy, 1),
+                     "gpu", where, busy, on=True, group=group + 2)
+
+    def _nvidia_cards(self, cards):
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            return []
+        try:
+            out = subprocess.run([exe, "--query-gpu=index,name,pci.bus_id,power.limit," + ",".join(NV_FIELDS),
+                                  "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        seen = {c["addr"] for c in cards}
+        found = []
+        for ln in out.splitlines():
+            f = [x.strip() for x in ln.split(",")]
+            if len(f) < 4 + len(NV_FIELDS) or not f[0].isdigit():
+                continue
+            addr = f[2].lower()[-12:]
+            if addr in seen:
+                continue
+            vals = dict(zip(NV_FIELDS, (_nv_value(x) for x in f[4:])))
+            found.append({"addr": addr if PCI_ADDR.match(addr) else None, "name": f[1] if f[1].upper().startswith("NVIDIA") else "NVIDIA " + f[1],
+                          "short": _short_gpu(f[1]), "chip": "nvidia-smi", "dev": "", "nv": int(f[0]),
+                          "limit": _nv_value(f[3]), "vals": vals})
+        return found
+
+    def _nvidia_gauges(self, c, pre, tag, where, limit, group):
+        i, vals, src = c["nv"], c["vals"], f"nvidia-smi -i {c['nv']}"
+        if vals["temperature.gpu"] is not None:
+            self.add(f"{pre}_temp", f"{tag} TEMP", "temp", "°C", 0, 100, limit, ("nv", i, "temperature.gpu"),
+                     "gpu", where, src, on=True, group=group, alert=limit)
+        if vals["power.draw"] is not None:
+            top = _round_up(c["limit"] or 300)
+            self.add(f"{pre}_power", f"{tag} POWER", "power", "W", 0, top, top * 0.9, ("nv", i, "power.draw"),
+                     "gpu", where, src, on=True, group=group if pre != "gpu" else group + 2)
+        if vals["utilization.gpu"] is not None:
+            self.add(f"{pre}_load", f"{tag} LOAD", "load", "%", 0, 100, 95, ("nv", i, "utilization.gpu"),
+                     "gpu", where, src, on=True, group=group if pre != "gpu" else group + 2)
+        if vals["fan.speed"] is not None:           # compute cards like the Tesla have no fan of their own
+            self.add(f"{pre}_fan", f"{tag} FAN", "fan", "%", 0, 100, 95, ("nv", i, "fan.speed"),
+                     "gpu", where, src, on=True, group=group + (1 if pre == "gpu" else 0))
+
+    def ram(self):
+        self.add("ram", "RAM", "memory", "%", 0, 100, _num_cfg("ram_alert", 95), ("ram",), "memory",
+                 "System memory", "/proc/meminfo", on=True, group=2, alert=_num_cfg("ram_alert", 95))
+
+    def boards(self, chips):
+        board = _board_name() or "Motherboard"
+        limit = _num_cfg("board_temp_alert", 60)
+        n_fan = 0
+        have_board_temp = False
+        for chip, path, _dev, ch in chips:
+            where = f"{board} ({_chip_name(chip)})"
+            laptop = any(chip.startswith(p) for p in LAPTOP_CHIPS)
+            temps = [(n, f, lab) for (k, n), (f, lab) in ch.items() if k == "temp" and _valid_temp(_num(f, 1000))]
+            main = next((t for t in temps if (t[2] or "").upper() in
+                         ("SYSTIN", "MOTHERBOARD", "BOARD", "SYSTEM", "MB TEMPERATURE", "AMBIENT")), None)
+            if not main and temps and not laptop:      # desktop sensor chips put the board on temp1
+                main = temps[0]
+            for t in temps:
+                if t is main and not have_board_temp:
+                    have_board_temp = True
+                    self.temp("board_temp", "BOARD", t[1], "board", where, limit, on=True, group=2,
+                              vmax=80, hyst=3)
+                    continue
+                raw = (t[2] or f"{_chip_name(chip).split()[0]} {t[0]}").upper()
+                lab = {"CPUTIN": "CPU SOCKET", "SYSTIN": "BOARD"}.get(raw, raw.replace("AUXTIN", "AUX "))
+                self.temp(f"board_{_slug(t[2] or 'temp' + str(t[0]))}", lab[:14], t[1], "board", where,
+                          limit, vmax=100, hyst=3)
+            for (k, n), (f, lab) in ch.items():
+                if k == "fan" and (_num(f) or 0) > 0:          # only headers with a fan that spins
+                    n_fan += 1
+                    top = _round_up(_num(f"{path}/fan{n}_max") or (6000 if laptop else 2500), 500)
+                    self.add(f"fan{n_fan}", _fan_label(lab, n_fan), "fan", "RPM", 0, top, top * 0.88,
+                             ("file", f, 1), "board", where, f, on=True, group=1.5 if n_fan <= 2 else 3,
+                             scale=1000)
+
+    def drives(self, chips):
+        limit = _num_cfg("drive_temp_alert", 70)
+        for chip, path, dev, ch in chips:
+            if chip == "nvme":
+                ctrl = os.path.basename(dev) if dev else "nvme"
+                model = _read(dev + "/model") if dev else None
+            else:            # drivetemp: the device is the SCSI disk
+                blocks = []
+                try:
+                    blocks = sorted(os.listdir(dev + "/block"))
+                except OSError:
+                    pass
+                ctrl = blocks[0] if blocks else "disk"
+                model = " ".join(x for x in (_read(dev + "/vendor"), _read(dev + "/model"))
+                                 if x and x.upper() != "ATA")
+            short = _short_drive(model) or ctrl.upper()
+            where = f"{model or 'Drive'} ({ctrl})"
+            temps = [(n, f, lab) for (k, n), (f, lab) in ch.items() if k == "temp" and _valid_temp(_num(f, 1000))]
+            for i, (n, f, lab) in enumerate(temps):
+                if i == 0:
+                    self.temp(f"{_slug(ctrl)}_temp", f"{short} TEMP", f, "drive", where, limit, on=True, group=6)
+                else:
+                    self.temp(f"{_slug(ctrl)}_{_slug(lab or 'temp' + str(n))}",
+                              f"{short} {(lab or str(n)).upper()}"[:16], f, "drive", where, limit)
+
+    def others(self, chips):
+        count = {}
+        for chip, path, dev, ch in chips:
+            role, tag = next(((r, t) for pref, r, t in OTHER_CHIPS if chip.startswith(pref)),
+                             ("other", chip.upper()[:10]))
+            count[tag] = count.get(tag, 0) + 1
+            n = count[tag]
+            pre = _slug(tag) + (str(n) if role == "memory" or n > 1 else "")
+            label = f"{tag} {n}" if role == "memory" or n > 1 else tag
+            where = _chip_name(chip)
+            for (k, i), (f, lab) in ch.items():
+                suffix = "" if i == 1 else f" {(lab or str(i)).upper()}"
+                if k == "temp" and _valid_temp(_num(f, 1000)):
+                    self.temp(f"{pre}_temp" if i == 1 else f"{pre}_{_slug(lab or 'temp' + str(i))}",
+                              (label + suffix)[:16], f, role, where, 90)
+                elif k == "fan" and (_num(f) or 0) > 0:
+                    self.add(f"{pre}_fan{i}", f"{label} FAN"[:16], "fan", "RPM", 0, 6000, 5500,
+                             ("file", f, 1), role, where, f, scale=1000)
+                elif k == "power" and _num(f) is not None:
+                    self.add(f"{pre}_power{i}", f"{label} POWER"[:16], "power", "W", 0, 100, 90,
+                             ("file", f, 1e6), role, where, f)
+
+
+def _nv_value(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None          # "[N/A]", "[Not Supported]"
 
 
 def _fan_label(raw, n):
@@ -240,51 +598,54 @@ def _fan_label(raw, n):
     return t[:10] if t else f"FAN {n}"
 
 
+def _demo_gauges():
+    """The look of a typical desktop with a compute card, for --demo."""
+    def g(key, label, kind, unit, vmax, red, group, scale=None, big=False, alert=None):
+        return _gauge(key, label, unit, 0, vmax, red, scale=scale, big=big, kind=kind, src=("demo",),
+                      device="demo", name="Demo machine", where="--demo", on=True, group=group,
+                      alert=alert, hyst=5)
+    return [g("cpu_temp", "CPU TEMP", "temp", "°C", 100, 80, 0, big=True, alert=80),
+            g("cpu_load", "CPU LOAD", "load", "%", 100, 90, 0, big=True),
+            g("gpu_temp", "RX 6600 TEMP", "temp", "°C", 100, 85, 1, alert=85),
+            g("fan1", "CPU FAN", "fan", "RPM", 2500, 2200, 1, scale=1000),
+            g("fan2", "CASE FAN", "fan", "RPM", 2500, 2200, 1, scale=1000),
+            g("gpu_fan", "RX 6600 FAN", "fan", "RPM", 3500, 3000, 1, scale=1000),
+            g("ram", "RAM", "memory", "%", 100, 95, 2, alert=95),
+            g("board_temp", "BOARD", "temp", "°C", 80, 60, 2, alert=60),
+            g("nv_temp", "P100 TEMP", "temp", "°C", 100, 85, 5, alert=85),
+            g("nv_power", "P100 POWER", "power", "W", 250, 225, 5)]
+
+
+def _cfg_keys(name):
+    return [k.strip() for k in CFG.get(name, "").split(",") if k.strip()]
+
+
+ALERT_RULES = {}
+
+
+def setup_layout():
+    """Find the machine's sensors and decide which ones the deck shows."""
+    ALL_GAUGES[:] = _demo_gauges() if DEMO else Finder().run()
+    show, hide = set(_cfg_keys("show")), set(_cfg_keys("hide"))
+    GAUGES[:] = [g for g in ALL_GAUGES if (g["on"] or g["key"] in show) and g["key"] not in hide]
+    ALERT_RULES.clear()
+    for g in ALL_GAUGES:
+        if g["alert"] is not None:
+            what = "Memory use" if g["kind"] == "memory" else g["label"].replace(" TEMP", "").strip()
+            what = {"CPU": "CPU", "BOARD": "Board"}.get(what, what)
+            ALERT_RULES[g["key"]] = (g["alert"], f"{what} temperature" if g["kind"] == "temp" else what,
+                                     g["unit"], g["hyst"])
+
+
 class Sensors:
-    """Finds the machine's sensors once at startup, then reads them."""
+    """Reads the sensors Finder found. Runs on a background thread."""
 
     def __init__(self):
         self._last_cpu = None
-        self.cpu = _find(CPU_CHIPS)
-        self.gpu = _find(GPU_CHIPS)
-        self.board = _find(BOARD_CHIPS)
-        self.nvidia = shutil.which("nvidia-smi") if not self.gpu else None
-        self.nv_row = NV_ROW
-        self.cpu_temp_file = self._cpu_temp_file()
-        self.fans = self._fans()
-
-    def _cpu_temp_file(self):
-        if not self.cpu:
-            return None
-        # prefer the whole-package / Tctl reading if it's labeled
-        for i in range(1, 64):
-            lab = _read(f"{self.cpu}/temp{i}_label")
-            if lab and ("Package" in lab or "Tctl" in lab or "Tdie" in lab):
-                return f"{self.cpu}/temp{i}_input"
-        return f"{self.cpu}/temp1_input"
-
-    def _fans(self):
-        # every fan header on the board chip that is actually spinning
-        found = []
-        if self.board:
-            for i in range(1, 16):
-                f = f"{self.board}/fan{i}_input"
-                v = _num(f)
-                if v is not None and v > 0:
-                    found.append((f, _fan_label(_read(f"{self.board}/fan{i}_label"), len(found) + 1)))
-        return found
-
-    def _nvidia(self):
-        try:
-            out = subprocess.run(
-                [self.nvidia, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2).stdout.split("\n")[0]
-            return float(out)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
+        self._energy = {}
 
     def cpu_load(self):
-        line = _read("/proc/stat")
+        line = _read(_p("/proc/stat"))
         if not line:
             return None
         parts = [int(x) for x in line.split()[1:]]
@@ -302,7 +663,7 @@ class Sensors:
     def ram():
         info = {}
         try:
-            with open("/proc/meminfo") as f:
+            with open(_p("/proc/meminfo")) as f:
                 for ln in f:
                     k, v = ln.split(":", 1)
                     info[k] = int(v.split()[0])
@@ -312,55 +673,76 @@ class Sensors:
             return None
         return 100.0 * (1 - info["MemAvailable"] / info["MemTotal"])
 
+    def energy(self, f, wrap):
+        """Watts from an energy counter in µJ, averaged since the last reading."""
+        e, now = _num(f), time.monotonic()
+        if e is None:
+            return None
+        last = self._energy.get(f)
+        self._energy[f] = (e, now)
+        if not last or now <= last[1]:
+            return None
+        de = e - last[0]
+        if de < 0:
+            de += _num(wrap) or 0
+        return de / 1e6 / (now - last[1]) if de >= 0 else None
+
+    @staticmethod
+    def nvidia():
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            return {}
+        try:
+            out = subprocess.run([exe, "--query-gpu=index," + ",".join(NV_FIELDS),
+                                  "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=2).stdout
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        cards = {}
+        for ln in out.splitlines():
+            f = [x.strip() for x in ln.split(",")]
+            if len(f) > len(NV_FIELDS) and f[0].isdigit():
+                cards[int(f[0])] = dict(zip(NV_FIELDS, (_nv_value(x) for x in f[1:])))
+        return cards
+
     def read_all(self, want=None):
-        """Read the wanted sources (all by default). Runs on a background thread."""
-        want = set(SOURCES) if want is None else set(want)
-        out = dict.fromkeys(SOURCES)
-        if "gpu_temp" in want:
-            t = _num(f"{self.gpu}/temp1_input", 1000) if self.gpu else None
-            if t is None and self.nvidia:
-                t = self._nvidia()
-            out["gpu_temp"] = t
-        if self.nv_row and want & {"nv_temp", "nv_power"}:
-            nv = _nvidia_query("temperature.gpu,power.draw")
-            if nv:
-                out["nv_temp"] = nv[0]
-                out["nv_power"] = nv[1] if len(nv) > 1 else None
-        if "cpu_temp" in want and self.cpu_temp_file:
-            out["cpu_temp"] = _num(self.cpu_temp_file, 1000)
-        if "board_temp" in want and self.board:
-            out["board_temp"] = _num(f"{self.board}/temp1_input", 1000)
-        for i, key in enumerate(("fan1", "fan2")):
-            if key in want and len(self.fans) > i:
-                out[key] = _num(self.fans[i][0])
-        if "gpu_fan" in want and self.gpu:
-            out["gpu_fan"] = _num(f"{self.gpu}/fan1_input")
-        if "cpu_load" in want:
-            out["cpu_load"] = self.cpu_load()
-        if "ram" in want:
-            out["ram"] = self.ram()
+        """Read the wanted gauges (all of them by default)."""
+        gauges = [g for g in ALL_GAUGES if want is None or g["key"] in want]
+        out = dict.fromkeys(g["key"] for g in ALL_GAUGES)
+        nv = self.nvidia() if any(g["src"][0] == "nv" for g in gauges) else {}
+        for g in gauges:
+            src = g["src"]
+            if src[0] == "file":
+                out[g["key"]] = _num(src[1], src[2])
+            elif src[0] == "nv":
+                out[g["key"]] = nv.get(src[1], {}).get(src[2])
+            elif src[0] == "energy":
+                out[g["key"]] = self.energy(src[1], src[2])
+            elif src[0] == "cpu_load":
+                out[g["key"]] = self.cpu_load()
+            elif src[0] == "ram":
+                out[g["key"]] = self.ram()
         return out
 
 
 class DemoSensors:
     """Made-up readings that drift up and down (run with --demo)."""
-    fans = [(None, "CPU FAN"), (None, "CASE FAN")]
 
     def __init__(self):
         self.t0 = time.time()
 
     def read_all(self, want=None):
         t = time.time() - self.t0
+        out = {}
+        for i, g in enumerate(ALL_GAUGES):
+            lo, hi = g["max"] * 0.3, g["red"] * 0.97
+            out[g["key"]] = lo + (hi - lo) * (0.5 + 0.5 * math.sin(t / (3 + i % 7) + i))
+        return out
 
-        def wave(period, lo, hi, shift=0.0):
-            return lo + (hi - lo) * (0.5 + 0.5 * math.sin(t / period + shift))
-        return {
-            "cpu_temp": wave(7, 42, 78), "cpu_load": wave(3, 6, 94, 1),
-            "gpu_temp": wave(9, 38, 71, 2), "fan1": wave(6, 800, 1800),
-            "fan2": wave(8, 700, 1500, 1), "gpu_fan": wave(5, 900, 2500, 2),
-            "ram": wave(20, 38, 66), "board_temp": wave(13, 30, 48),
-            "nv_temp": wave(11, 40, 82), "nv_power": wave(4, 60, NV_POWER_MAX * 0.8),
-        }
+
+setup_layout()
+# the reading on the dock icon: the CPU temperature, or the first one there is
+BADGE_KEY = next((g["key"] for g in GAUGES if g["kind"] == "temp"), "cpu_temp")
 
 
 class Poller:
@@ -1408,17 +1790,6 @@ def strip_cell_at(count, vertical, px, py, w, h):
 
 
 # ---------------------------------------------------------------- alerts
-ALERT_RULES = {
-    # source:      (limit,                                  name,          unit)
-    "cpu_temp":   (_num_cfg("cpu_temp_alert", 80),   "CPU temperature",   "°C"),
-    "gpu_temp":   (_num_cfg("gpu_temp_alert", 85),   "GPU temperature",   "°C"),
-    "board_temp": (_num_cfg("board_temp_alert", 60), "Board temperature", "°C"),
-    "ram":        (_num_cfg("ram_alert", 95),        "Memory use",        "%"),
-}
-HYSTERESIS = {"cpu_temp": 5, "gpu_temp": 5, "board_temp": 3, "ram": 5, "nv_temp": 5}
-
-setup_layout()
-
 SOUND_CMDS = [
     ["canberra-gtk-play", "-i", "alarm-clock-elapsed"],
     ["paplay", "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"],
@@ -1481,19 +1852,19 @@ class Alerts:
         """v: latest readings. shown: the gauges this window is responsible for."""
         if not _on("alerts"):
             return
-        for src, (limit, name, unit) in ALERT_RULES.items():
+        for src, (limit, name, unit, hyst) in ALERT_RULES.items():
             if src not in shown:
                 self._forget(src)
                 continue
             val = v.get(src)
             if val is None:
                 continue
-            self._check(src, val >= limit, val < limit - HYSTERESIS[src],
+            self._check(src, val >= limit, val < limit - hyst,
                         f"{name} is critical",
                         f"{name} is {val:.0f}{unit} (alert at {limit:.0f}{unit}).",
                         f"{name} is down to {val:.0f}{unit}.")
         if _on("fan_stop_alert"):
-            for fan in ("fan1", "fan2", "gpu_fan"):
+            for fan in [g["key"] for g in ALL_GAUGES if g["kind"] == "fan" and g["unit"] == "RPM"]:
                 if fan not in shown:
                     self._forget(fan + "_stop")
                     continue
@@ -1667,7 +2038,7 @@ class BaseWindow(Gtk.ApplicationWindow):
     """What every GaugeDeck window shares: live readings from a background
     thread, alerts, blinking, redraws when the look changes, and the dock badge."""
     mode = "deck"
-    badge_key = "cpu_temp"
+    badge_key = BADGE_KEY
 
     def __init__(self, app, title):
         super().__init__(application=app, title=title)
@@ -1941,7 +2312,7 @@ class DeckWindow(BaseWindow):
 
     def _draw(self, _area, cr, w, h):
         placed, bh = self._layout_cache
-        draw_deck(cr, w, h, placed, bh, self.values, self.app.fan_labels, self.app.theme,
+        draw_deck(cr, w, h, placed, bh, self.values, {}, self.app.theme,
                   self.alerts.active | self.test_flash, self.blink, TITLE, self.history)
 
     def _on_close(self, win):
@@ -2068,7 +2439,7 @@ class GaugeWindow(OverlayWindow):
 class StripWindow(OverlayWindow):
     """A slim bar of readings: small enough to leave on screen all the time."""
     mode = "strip"
-    badge_key = "cpu_temp"
+    badge_key = BADGE_KEY
 
     def __init__(self, app):
         self.vertical = bool(win_state("strip").get("vertical", False))
@@ -2110,7 +2481,7 @@ class StripWindow(OverlayWindow):
         return [g for g in GAUGES if g["key"] in self.keys]
 
     def _draw(self, _area, cr, w, h):
-        draw_strip(cr, w, h, self.gauges(), self.values, self.app.fan_labels, self.app.theme,
+        draw_strip(cr, w, h, self.gauges(), self.values, {}, self.app.theme,
                    self.alerts.active | self.test_flash, self.blink, self.vertical)
 
     def _resize_to_content(self):
@@ -2433,7 +2804,6 @@ class GaugeApp(Gtk.Application):
         self.mode, self.key, self.test_alert = mode, key, test_alert
         self.theme = Theme()
         self.sensors = DemoSensors() if DEMO else Sensors()
-        self.fan_labels = {f"fan{i + 1}": lab for i, (_f, lab) in enumerate(self.sensors.fans[:2])}
         self.customize_win = None
         self._monitor = None
 
@@ -2469,7 +2839,7 @@ class GaugeApp(Gtk.Application):
     # --- helpers the windows use
     def display_label(self, key):
         g = gauge_by_key(key)
-        return self.theme.label(key) or self.fan_labels.get(key) or (g["label"] if g else key.upper())
+        return self.theme.label(key) or (g["label"] if g else key.upper())
 
     def notify(self, key, title, body, urgent):
         n = Gio.Notification.new(title)
@@ -2510,16 +2880,41 @@ class GaugeApp(Gtk.Application):
         about.present()
 
 
+def print_check():
+    """--check: every sensor found, what it is, and a reading from it."""
+    sensors = DemoSensors() if DEMO else Sensors()
+    sensors.read_all()
+    time.sleep(0.5)                  # load and power are measured over a short while
+    vals = sensors.read_all()
+    shown = {g["key"] for g in GAUGES}
+    print(f"GaugeDeck {VERSION}")
+    print(f"CPU: {_cpu_name()}")
+    print(f"Board: {_board_name() or 'unknown'}")
+    print(f"Found {len(ALL_GAUGES)} sensors, {len(GAUGES)} on the deck (*).")
+    rows = [("", "KEY", "GAUGE", "TYPE", "READING", "DEVICE", "SOURCE")]
+    for g in ALL_GAUGES:
+        rows.append(("*" if g["key"] in shown else " ", g["key"], g["label"], g["kind"] if g["device"] == g["kind"] else f"{g['device']} {g['kind']}",
+                     _value_text(g, vals.get(g["key"])), g["name"], g["where"].replace(ROOT, "") if ROOT else g["where"]))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1])
+    tips = []
+    if not any(g["device"] == "board" for g in ALL_GAUGES):
+        tips.append("No board sensors or case fans. Install lm-sensors and run `sudo sensors-detect` once.")
+    if os.path.isdir(_p("/proc/driver/nvidia")) and not shutil.which("nvidia-smi"):
+        tips.append("An NVIDIA driver is loaded but nvidia-smi is missing, so its cards can't be read.")
+    tips.append("Show more on the deck with show=KEY,KEY in ~/.config/gaugedeck/config, or hide=KEY to drop one.")
+    for t in tips:
+        print("Tip:", t)
+
+
 def main(argv):
     mode, key, test_alert = "deck", None, False
     i = 1
     while i < len(argv):
         a = argv[i]
         if a == "--check":
-            print(f"GaugeDeck {VERSION}")
-            print("NVIDIA card:", NV_MODEL or "not found")
-            print("Display card sensor:", "found" if _has_display_gpu() else "not found")
-            print("NVIDIA row:", "ON" if NV_ROW else "off")
+            print_check()
             return 0
         if a == "--version":
             print(f"GaugeDeck {VERSION}")
