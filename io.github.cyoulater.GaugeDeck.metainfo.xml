@@ -40,6 +40,9 @@
     <category>Monitor</category>
   </categories>
   <releases>
+    <release version="1.3.0" date="2026-10-17">
+      <description><p>Customize window with gauge styles, glow and background pictures; pop-out gauge windows; compact strip of readings; sensor reads no longer freeze the window.</p></description>
+    </release>
     <release version="1.2.1" date="2026-10-01">
       <description><p>Temperature and power gauges for an NVIDIA compute card running next to an AMD or Intel display card, with a temperature alert.</p></description>
     </release>
