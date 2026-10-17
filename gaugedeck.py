@@ -35,15 +35,16 @@ import zlib
 from collections import deque
 from xml.sax.saxutils import escape as xml_escape
 
-import cairo
-import gi
-gi.require_version("Gtk", "4.0")
-gi.require_version("Gdk", "4.0")
+_NEEDS = ("GaugeDeck needs GTK 4 and its Python support.\n"
+          "Install them with:  sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0")
 try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    import cairo
     gi.require_foreign("cairo")
-except ImportError:
-    sys.exit("GaugeDeck needs the python3-gi-cairo package.\n"
-             "Install it with:  sudo apt install python3-gi-cairo")
+except (ImportError, ValueError):
+    sys.exit(_NEEDS)
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 APP_NAME = "GaugeDeck"
@@ -54,22 +55,34 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
 THEME_PATH = os.path.join(CONFIG_DIR, "theme.json")
 STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
 DEMO = "--demo" in sys.argv       # made-up readings, for trying the look on any machine
-UPDATE_SECONDS = 1
-HAS_NEW_DIALOGS = hasattr(Gtk, "ColorDialogButton") and hasattr(Gtk, "AlertDialog")  # GTK 4.10+
+# GTK 4.10 added new dialog widgets. Older systems (Debian 12 and MX Linux 23 ship GTK 4.8) get the
+# older ones, which still work. GAUGEDECK_OLD_GTK=1 forces the older ones, for testing.
+_OLD = bool(os.environ.get("GAUGEDECK_OLD_GTK"))
+HAS_COLOR_DIALOG = hasattr(Gtk, "ColorDialogButton") and not _OLD
+HAS_ALERT_DIALOG = hasattr(Gtk, "AlertDialog") and not _OLD
+HAS_FILE_DIALOG = hasattr(Gtk, "FileDialog") and not _OLD
 
 
-def load_config():
-    cfg = {"title": "GAUGEDECK", "scale": "0.6",
+def load_config(path=None):
+    """Read ~/.config/gaugedeck/config (key=value lines). Files from older versions load unchanged:
+    unknown keys are ignored, and notes after a # on the same line (as in the README example) are fine."""
+    cfg = {"title": "GAUGEDECK", "scale": "0.6", "update_seconds": "1",
            "alerts": "on", "alert_sound": "on", "alert_seconds": "5",
            "cpu_temp_alert": "80", "gpu_temp_alert": "85",
            "board_temp_alert": "60", "ram_alert": "95", "fan_stop_alert": "on",
            "nv_temp_alert": "85", "dock_badge": "on"}
     try:
-        with open(CONFIG_PATH) as f:
+        with open(path or CONFIG_PATH, errors="replace") as f:
             for ln in f:
-                if "=" in ln and not ln.strip().startswith("#"):
+                ln = ln.strip().lstrip("\ufeff")
+                if "=" in ln and not ln.startswith("#"):
                     k, v = ln.split("=", 1)
-                    cfg[k.strip().lower()] = v.strip()
+                    v = v.strip()
+                    if k.strip().lower() != "title":                      # a title may hold a "#"
+                        v = re.sub(r"\s+#.*$", "", v)                     # "0.6   # 0.3 = tiny" -> "0.6"
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    cfg[k.strip().lower()] = v
     except OSError:
         pass
     return cfg
@@ -94,6 +107,10 @@ try:
 except ValueError:
     SCALE = 0.6
 TITLE = CFG["title"][:24]
+try:
+    UPDATE_SECONDS = max(0.5, min(10.0, float(CFG["update_seconds"])))
+except ValueError:
+    UPDATE_SECONDS = 1.0
 
 
 def _gauge(key, label, unit, vmin, vmax, red, scale=None, big=False):
@@ -102,11 +119,13 @@ def _gauge(key, label, unit, vmin, vmax, red, scale=None, big=False):
 
 
 def _sensor(key, label, name, kind, unit, vmin, vmax, red, src, default=False, group="Other",
-            scale=None, big=False, alert_name=None):
-    """A gauge plus what it is (name, kind, group) and where its reading comes from (src)."""
+            scale=None, big=False, alert_name=None, junk=""):
+    """A gauge plus what it is (name, kind, group) and where its reading comes from (src).
+    junk: why this sensor looks unconnected or bogus ("" if it looks real). Such a sensor is off by
+    default and never raises an alert."""
     g = _gauge(key, label, unit, vmin, vmax, red, scale, big)
-    g.update(name=name, kind=kind, src=src, default=default, group=group,
-             alert_name=alert_name or name)
+    g.update(name=name, kind=kind, src=src, default=default and not junk, group=group,
+             alert_name=alert_name or name, junk=junk)
     return g
 
 
@@ -175,8 +194,27 @@ def _fan_label(raw, n):
     if not raw:
         return f"FAN {n}"
     t = raw.upper().replace("PROCESSOR", "CPU").replace("MOTHERBOARD", "BOARD")
-    t = t.replace("SYSTEM", "SYS").replace("CHASSIS", "CASE").replace("  ", " ").strip()
-    return t[:10] if t else f"FAN {n}"
+    t = t.replace("POWER SUPPLY", "PSU").replace("SYSTEM", "SYS").replace("CHASSIS", "CASE")
+    t = t.replace("  ", " ").strip()
+    if len(t) > 12 and t.endswith(" FAN"):
+        t = t[:-4]
+    return t[:12] if t else f"FAN {n}"
+
+
+def _board_temp_file(path):
+    """The motherboard's own temperature on a chip: a labeled system/board reading if there is one,
+    else temp1 unless that is just the CPU or GPU again (Dell's dell_smm chip labels temp1 'CPU').
+    None if the chip has no board temperature."""
+    labels = {}
+    for n in range(1, 16):
+        if os.path.exists(f"{path}/temp{n}_input"):
+            labels[n] = (_read(f"{path}/temp{n}_label") or "").lower()
+    for n, lab in labels.items():
+        if any(w in lab for w in ("systin", "motherboard", "board", "system", "ambient", "chassis", "case")):
+            return f"{path}/temp{n}_input"
+    if 1 in labels and labels[1] not in ("cpu", "gpu", "package id 0"):
+        return f"{path}/temp1_input"
+    return None
 
 
 _PCI_IDS = None
@@ -205,8 +243,31 @@ def _pci_name(vendor, device):
     if not raw:
         return None
     m = re.search(r"\[([^\]]+)\]", raw)
-    text = m.group(1) if m else raw
-    return text.split("/")[0].strip()
+    return (m.group(1) if m else raw).strip()          # keep every model the id covers: do not guess one
+
+
+def _temp_suspect(path, n, v, label):
+    """Why a temperature reading looks unconnected or bogus, or "" if it looks real. Motherboard chips
+    list sensors with nothing attached: they read 0, a fixed 114-117, or a limit of 0 with the alarm on."""
+    if v is None:
+        return "no reading"
+    if v <= 0:
+        return "reads 0 or below, so nothing is probably connected"
+    if v >= 110:
+        return f"reads {v:.0f} °C, which is not a real temperature"
+    if "peci" in label.lower():
+        return "a distance to the limit, not a temperature"
+    if _num(f"{path}/temp{n}_alarm") == 1 and _num(f"{path}/temp{n}_max", 1000) == 0:
+        return "its limit is 0 and its alarm is on, so nothing is probably connected"
+    return ""
+
+
+def _volt_suspect(path, n, v):
+    if v is None or v <= 0.004:
+        return "reads 0 V, so nothing is probably connected"
+    if _num(f"{path}/in{n}_alarm") == 1 and _num(f"{path}/in{n}_max", 1000) == 0:
+        return "its limit is 0 and its alarm is on, so nothing is probably connected"
+    return ""
 
 
 def _short_gpu_name(name):
@@ -228,6 +289,7 @@ def _short_gpu_name(name):
 
 
 # --- NVIDIA cards (read with the nvidia-smi tool that comes with the driver)
+NV_CACHE_SECONDS = 3.0
 NV_FIELDS = ("temperature.gpu", "power.draw", "power.limit", "fan.speed", "utilization.gpu",
              "memory.used", "memory.total", "clocks.sm")
 
@@ -239,15 +301,16 @@ def _to_float(x):
         return None
 
 
-def _nvidia_query_all():
-    """{card number: {field: value}} for every NVIDIA card, or {} if there are none."""
+def _nvidia_query_all(timeout=4):
+    """{card number: {field: value}} for every NVIDIA card, or {} if there are none.
+    Uses only the nvidia-smi tool, so it works without /proc/driver/nvidia (headless server drivers)."""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return {}
     try:
         out = subprocess.run([exe, "--query-gpu=index,name," + ",".join(NV_FIELDS),
                               "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=4).stdout
+                             capture_output=True, text=True, timeout=timeout).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
     cards = {}
@@ -301,7 +364,7 @@ def _device_title(chip):
     dev = chip["dev"]
     if not dev:
         return ""
-    model = _read(os.path.join(dev, "model"))
+    model = _read(os.path.join(dev, "model")) or _read(os.path.join(dev, "product_name"))
     if model:
         return re.sub(r"\s+", " ", model)
     vendor, device = _read(os.path.join(dev, "vendor")), _read(os.path.join(dev, "device"))
@@ -320,7 +383,7 @@ def discover(root="/", nvidia=None, cpu_model=None):
     sysd, procd = os.path.join(root, "sys"), os.path.join(root, "proc")
     chips = _chips(root)
     if nvidia is None:
-        nvidia = _nvidia_query_all()
+        nvidia = _nvidia_query_all(timeout=15)          # the first call can be slow while the card wakes up
     cpu_name = _cpu_model(root) if cpu_model is None else cpu_model
     found, claimed, keys = [], set(), set()
 
@@ -350,7 +413,8 @@ def discover(root="/", nvidia=None, cpu_model=None):
                 break
         add(_sensor("cpu_temp", "CPU TEMP", "CPU temperature", "temp", "°C", 0, 100,
                     _num_cfg("cpu_temp_alert", 80), ("file", f, 1000), True, "CPU", big=True,
-                    alert_name="CPU temperature"), [f])
+                    alert_name="CPU temperature", junk=_temp_suspect(cpu["path"], f.rsplit("/temp", 1)[1].split("_")[0],
+                                                                    _num(f, 1000), "")), [f])
     add(_sensor("cpu_load", "CPU LOAD", "CPU load", "load", "%", 0, 100, 90,
                 ("cpu_load", os.path.join(procd, "stat")), True, "CPU", big=True))
 
@@ -359,7 +423,7 @@ def discover(root="/", nvidia=None, cpu_model=None):
         f = f"{gpu['path']}/temp1_input"
         add(_sensor("gpu_temp", "GPU TEMP", "GPU temperature", "temp", "°C", 0, 100,
                     _num_cfg("gpu_temp_alert", 85), ("file", f, 1000), True, "GPU",
-                    alert_name="GPU temperature"), [f])
+                    alert_name="GPU temperature", junk=_temp_suspect(gpu["path"], 1, _num(f, 1000), "")), [f])
     elif nv0 is not None:                       # the NVIDIA card is the display card
         add(_sensor("gpu_temp", "GPU TEMP", "GPU temperature", "temp", "°C", 0, 100,
                     _num_cfg("gpu_temp_alert", 85), ("nv", 0, "temperature.gpu"), True, "GPU",
@@ -372,9 +436,10 @@ def discover(root="/", nvidia=None, cpu_model=None):
             v = _num(f)
             if v is not None and v > 0:
                 fan_n += 1
-                label = _fan_label(_read(f"{board['path']}/fan{i}_label"), fan_n)
+                raw = _read(f"{board['path']}/fan{i}_label")
+                label = _fan_label(raw, fan_n)
                 top = _nice_ceil(max(2500, v * 1.3))
-                add(_sensor(f"fan{fan_n}", label, f"{label.title()} speed", "fan", "RPM", 0, top,
+                add(_sensor(f"fan{fan_n}", label, f"{raw or f'Fan {fan_n}'} speed", "fan", "RPM", 0, top,
                             round(top * 0.88), ("file", f, 1), True, "Fans", scale=1000), [f])
     if gpu and os.path.exists(f"{gpu['path']}/fan1_input"):
         f = f"{gpu['path']}/fan1_input"
@@ -384,11 +449,14 @@ def discover(root="/", nvidia=None, cpu_model=None):
     add(_sensor("ram", "RAM", "Memory used", "mem", "%", 0, 100, _num_cfg("ram_alert", 95),
                 ("ram", os.path.join(procd, "meminfo")), True, "System", alert_name="Memory use"))
 
-    if board and os.path.exists(f"{board['path']}/temp1_input"):
-        f = f"{board['path']}/temp1_input"
+    f = _board_temp_file(board["path"]) if board else None
+    if f:
+        n = f.rsplit("/temp", 1)[1].split("_")[0]
         add(_sensor("board_temp", "BOARD", "Board temperature", "temp", "°C", 0, 80,
                     _num_cfg("board_temp_alert", 60), ("file", f, 1000), True, "Board",
-                    alert_name="Board temperature"), [f])
+                    alert_name="Board temperature",
+                    junk=_temp_suspect(board["path"], n, _num(f, 1000), _read(f"{board['path']}/temp{n}_label") or "")),
+            [f])
 
     # --- NVIDIA cards ------------------------------------------------------------
     for idx in sorted(nvidia):
@@ -453,6 +521,7 @@ def discover(root="/", nvidia=None, cpu_model=None):
             if v is None or v <= -50 or f in claimed:
                 continue
             lab = raw_label("temp", n)
+            suspect = _temp_suspect(path, n, v, lab)
             composite = lab.lower() == "composite"
             plain = not lab or lab.lower() == f"temp{n}"
             limit = _num(f"{path}/temp{n}_max", 1000) or _num(f"{path}/temp{n}_crit", 1000)
@@ -467,7 +536,7 @@ def discover(root="/", nvidia=None, cpu_model=None):
             group = "Storage" if drive else {"GPU": "GPU", "iGPU": "GPU", "CPU": "CPU"}.get(short, "Board")
             add(_sensor(f"{tag}_{_slug(lab or f'temp{n}')}", screen_label(label), name, "temp", "°C",
                         0, top, round(red), ("file", f, 1000), drive and (composite or n == 1), group,
-                        alert_name=name), [f])
+                        alert_name=name, junk=suspect), [f])
         for n in range(1, 40):
             f = f"{path}/fan{n}_input"
             v = _num(f)
@@ -487,11 +556,12 @@ def discover(root="/", nvidia=None, cpu_model=None):
             if v is None or f in claimed:
                 continue
             lab = raw_label("in", n)
+            suspect = _volt_suspect(path, n, v)
             plain = not lab or lab.lower() == f"in{n}"
             top = _nice_ceil(max(v * 1.4, 1.5))
             add(_sensor(f"{tag}_{_slug(lab or f'in{n}')}", screen_label(f"{tagged} V{n}" if plain else f"{tagged} {lab}"),
                         f"{who} voltage {n}" if plain else f"{who} {lab} voltage", "volt", "V", 0, top, top,
-                        ("file", f, 1000), False, "Power and voltage"), [f])
+                        ("file", f, 1000), False, "Power and voltage", junk=suspect), [f])
         for n in range(1, 10):
             for stem in ("average", "input"):
                 f = f"{path}/power{n}_{stem}"
@@ -551,6 +621,7 @@ class Sensors:
         self.catalog = {s["key"]: s for s in catalog}
         self._last_cpu = None
         self._lock = threading.Lock()     # the deck and the Sensors window may both be reading
+        self._nv = ({}, 0.0)              # last nvidia-smi answer and when it was taken
 
     def _cpu_load(self, path):
         line = _read(path)
@@ -603,6 +674,17 @@ class Sensors:
             return None
         return sum(vals) / len(vals) if vals else None
 
+    def _nvidia(self):
+        """nvidia-smi starts a whole program each time, so ask at most every few seconds."""
+        data, taken = self._nv
+        now = time.monotonic()
+        if not data or now - taken >= max(UPDATE_SECONDS, NV_CACHE_SECONDS):
+            fresh = _nvidia_query_all()
+            if fresh:
+                self._nv = (fresh, now)
+                return fresh
+        return data
+
     def _one(self, src, nv):
         kind = src[0]
         if kind == "file":
@@ -637,7 +719,7 @@ class Sensors:
         """Read the wanted sensors (all by default) -> {key: value or None}."""
         keys = list(self.catalog) if want is None else [k for k in want if k in self.catalog]
         with self._lock:
-            nv = _nvidia_query_all() if any(self.catalog[k]["src"][0] in ("nv", "nv_vram") for k in keys) else {}
+            nv = self._nvidia() if any(self.catalog[k]["src"][0] in ("nv", "nv_vram") for k in keys) else {}
             out = {}
             for k in keys:
                 try:
@@ -998,11 +1080,12 @@ def clean_style(d):
 
 class Look:
     """The colors (as 0-1 RGB) and shape choices for one gauge."""
-    __slots__ = ("c", "s")
+    __slots__ = ("c", "s", "sig")
 
     def __init__(self, colors, style):
         self.c = {k: _hex_to_rgb(v) for k, v in colors.items()}
         self.s = style
+        self.sig = hash((tuple(sorted(colors.items())), tuple(sorted(style.items()))))   # changes when the look does
 
 
 class Theme:
@@ -1236,7 +1319,8 @@ def save_win_state(name, **kw):
 
 
 # ---------------------------------------------------------------- the sensor list
-CATALOG = demo_catalog() if DEMO else discover()
+# GAUGEDECK_ROOT points the scanner at a pretend computer's folders (used only for testing)
+CATALOG = demo_catalog() if DEMO else discover(os.environ.get("GAUGEDECK_ROOT") or "/")
 REG = Registry(CATALOG)
 
 
@@ -1264,6 +1348,16 @@ class Pictures:
 
     def __init__(self):
         self.cache = {}
+
+    @staticmethod
+    def stamp(path):
+        """When the picture file last changed (None if there is no such file)."""
+        if not path:
+            return None
+        try:
+            return os.stat(os.path.expanduser(path)).st_mtime
+        except OSError:
+            return None
 
     def get(self, path):
         if not path or GdkPixbuf is None:
@@ -1293,15 +1387,23 @@ PICTURES = Pictures()
 
 
 def _draw_picture(cr, pb, cx, cy, w, h):
-    """Fill the w x h box centered on (cx, cy) with the picture, cropping the edges."""
+    """Fill the w x h box centered on (cx, cy) with the picture, cropping the edges.
+    Returns False (and draws nothing) if the picture can't be drawn."""
     pw, ph = pb.get_width(), pb.get_height()
+    if pw <= 0 or ph <= 0:
+        return False
     k = max(w / pw, h / ph)
     cr.save()
-    cr.translate(cx - pw * k / 2.0, cy - ph * k / 2.0)
-    cr.scale(k, k)
-    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
-    cr.paint()
-    cr.restore()
+    try:
+        cr.translate(cx - pw * k / 2.0, cy - ph * k / 2.0)
+        cr.scale(k, k)
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+        cr.paint()
+        return True
+    except Exception:
+        return False
+    finally:
+        cr.restore()
 
 
 def _draw_background(cr, w, h, look):
@@ -1309,8 +1411,7 @@ def _draw_background(cr, w, h, look):
     cr.set_source_rgb(*c["bg"])
     cr.paint()
     pb = PICTURES.get(st["bg_image"])
-    if pb:
-        _draw_picture(cr, pb, w / 2.0, h / 2.0, w, h)
+    if pb and _draw_picture(cr, pb, w / 2.0, h / 2.0, w, h):
         cr.set_source_rgba(*c["bg"], st["bg_dim"])
         cr.paint()
 
@@ -1414,8 +1515,7 @@ def _frame(cr, x, y, r, look, alarm, hot):
     cr.save()
     cr.clip()
     pb = PICTURES.get(st["image"])
-    if pb:
-        _draw_picture(cr, pb, x, y, 2 * r, 2 * r)
+    if pb and _draw_picture(cr, pb, x, y, 2 * r, 2 * r):
         cr.set_source_rgba(*c["face"], st["image_dim"])
         cr.paint()
     if gl > 0:                                  # backlight: the face brightens toward the rim
@@ -1459,7 +1559,8 @@ def _value_text(g, v):
     return f"{_fmt_num(v, g)} {g['unit']}" if v is not None else "--"
 
 
-def _dial(cr, x, y, r, g, v, look, label, hist):
+def _dial_static(cr, x, y, r, g, look, label):
+    """The parts of a dial that stay the same between readings: red zone, ticks, numbers, name."""
     c, st = look.c, look.s
     gl = st["glow"]
     vmin, vmax, red, scale = g["min"], g["max"], g["red"], g["scale"]
@@ -1512,6 +1613,21 @@ def _dial(cr, x, y, r, g, v, look, label, hist):
             _glow_text(cr, s, x + rt * math.cos(a), y + rt * math.sin(a), r * 0.13, c["dim"], gl * 0.6)
 
     _glow_text(cr, label, x, y + r * 0.30, r * 0.12, c["dim"], gl * 0.5)
+
+
+def _dial_dynamic(cr, x, y, r, g, v, look, hist=None):
+    """The parts of a dial that change with the reading: the number, the needle and the center cap."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    sweep = st["sweep"]
+    a0 = 90 + (360 - sweep) / 2.0
+
+    def ang(val):
+        t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+        return math.radians(a0 + sweep * t)
+
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
     txt = _value_text(g, v)
     size = _fit_text(cr, txt, r * 0.2, r * 1.4)         # keep long readings such as "2100 RPM" inside
     _glow_text(cr, txt, x, y + r * 0.60, size,
@@ -1570,8 +1686,8 @@ def _dial(cr, x, y, r, g, v, look, label, hist):
         cr.stroke()
 
 
-def _ring(cr, x, y, r, g, v, look, label, hist):
-    """A thick ring that fills up, with the reading in the middle."""
+def _ring_static(cr, x, y, r, g, look, label):
+    """The unchanging part of a ring: the track, the red zone, the unit and the name."""
     c, st = look.c, look.s
     gl = st["glow"]
     vmin, vmax, red = g["min"], g["max"], g["red"]
@@ -1595,35 +1711,49 @@ def _ring(cr, x, y, r, g, v, look, label, hist):
         cr.set_line_width(lw * 0.22)
         cr.set_source_rgb(*c["red"])
         cr.stroke()
+    cr.set_line_cap(0)
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    _glow_text(cr, g["unit"], x, y + r * 0.22, r * 0.13, c["dim"], gl * 0.5)
+    _glow_text(cr, label, x, y + r * 0.44, _fit_text(cr, label, r * 0.12, r * 1.2), c["dim"], gl * 0.5)
+
+
+def _ring_dynamic(cr, x, y, r, g, v, look, hist=None):
+    """A ring that fills up, with the reading in the middle."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    sweep = st["sweep"]
+    a0 = 90 + (360 - sweep) / 2.0
+
+    def ang(val):
+        t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+        return math.radians(a0 + sweep * t)
+
+    rad, lw = r * 0.70, r * 0.17
     over = v is not None and st["red_zone"] and v >= red
     if v is not None and v > vmin:
         col = c["red"] if over else c["needle"]
+        cr.set_line_cap(1)
         cr.new_path()
         cr.arc(x, y, rad, ang(vmin), ang(v))
         _halo(cr, col, lw, gl)
         cr.set_line_width(lw)
         cr.set_source_rgb(*col)
         cr.stroke()
-    cr.set_line_cap(0)
+        cr.set_line_cap(0)
     cr.select_font_face(FONTS[st["font"]], 0, 1)
     num = _fmt_num(v, g)
     _glow_text(cr, num, x, y - r * 0.08, _fit_text(cr, num, r * 0.46, r * 1.0),
                c["red"] if over else c["text"], gl)
-    _glow_text(cr, g["unit"], x, y + r * 0.22, r * 0.13, c["dim"], gl * 0.5)
-    _glow_text(cr, label, x, y + r * 0.44, _fit_text(cr, label, r * 0.12, r * 1.2), c["dim"], gl * 0.5)
 
 
-def _bar(cr, x, y, r, g, v, look, label, hist):
-    """A horizontal level meter."""
+def _bar_static(cr, x, y, r, g, look, label):
+    """The unchanging part of a bar: the name, the empty track with its red zone, and the end numbers."""
     c, st = look.c, look.s
     gl = st["glow"]
     vmin, vmax, red = g["min"], g["max"], g["red"]
     cr.select_font_face(FONTS[st["font"]], 0, 1)
     _glow_text(cr, label, x, y - r * 0.58, _fit_text(cr, label, r * 0.14, r * 1.4), c["dim"], gl * 0.5)
-    txt = _value_text(g, v)
-    over = v is not None and st["red_zone"] and v >= red
-    _glow_text(cr, txt, x, y - r * 0.18, _fit_text(cr, txt, r * 0.3, r * 1.45),
-               c["red"] if over else c["text"], gl)
     bx, bw, by, bh = x - r * 0.75, r * 1.5, y + r * 0.22, r * 0.22
     _round_rect(cr, bx, by, bw, bh, bh / 2)
     cr.set_source_rgb(*_mix(c["face"], c["rim"], 0.25))
@@ -1637,6 +1767,21 @@ def _bar(cr, x, y, r, g, v, look, label, hist):
         cr.set_source_rgba(*c["red"], 0.45)
         cr.fill()
         cr.restore()
+    _glow_text(cr, f"{vmin:g}", bx, y + r * 0.66, r * 0.1, c["dim"], 0, "left")
+    _glow_text(cr, f"{vmax:g}", bx + bw, y + r * 0.66, r * 0.1, c["dim"], 0, "right")
+
+
+def _bar_dynamic(cr, x, y, r, g, v, look, hist=None):
+    """A horizontal level meter: the reading and the filled part."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    txt = _value_text(g, v)
+    over = v is not None and st["red_zone"] and v >= red
+    _glow_text(cr, txt, x, y - r * 0.18, _fit_text(cr, txt, r * 0.3, r * 1.45),
+               c["red"] if over else c["text"], gl)
+    bx, bw, by, bh = x - r * 0.75, r * 1.5, y + r * 0.22, r * 0.22
     if v is not None:
         t = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
         if t > 0:
@@ -1645,8 +1790,6 @@ def _bar(cr, x, y, r, g, v, look, label, hist):
             _halo_fill(cr, col, bh * 0.6, gl)
             cr.set_source_rgb(*col)
             cr.fill()
-    _glow_text(cr, f"{vmin:g}", bx, y + r * 0.66, r * 0.1, c["dim"], 0, "left")
-    _glow_text(cr, f"{vmax:g}", bx + bw, y + r * 0.66, r * 0.1, c["dim"], 0, "right")
 
 
 def _halo_fill(cr, color, width, glow):
@@ -1655,15 +1798,39 @@ def _halo_fill(cr, color, width, glow):
         _halo(cr, color, width, glow)
 
 
-def _digital(cr, x, y, r, g, v, look, label, hist):
-    """A big number with a row of segments that light up."""
+_SEGMENTS = 12
+
+
+def _segment(cr, x, y, r, i):
+    sw, gap = (r * 1.5) / _SEGMENTS, r * 0.04
+    _round_rect(cr, x - r * 0.75 + i * sw + gap / 2, y + r * 0.34, sw - gap, r * 0.2, r * 0.04)
+
+
+def _segment_color(c, st, g, i):
+    seg_red = st["red_zone"] and (g["min"] + (g["max"] - g["min"]) * (i + 0.5) / _SEGMENTS) >= g["red"]
+    return c["red"] if seg_red else c["needle"]
+
+
+def _digital_static(cr, x, y, r, g, look, label):
+    """The unchanging part of the digital style: the name and the row of unlit segments."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    _glow_text(cr, label, x, y - r * 0.62, _fit_text(cr, label, r * 0.14, r * 1.4), c["dim"], gl * 0.5)
+    for i in range(_SEGMENTS):
+        _segment(cr, x, y, r, i)
+        cr.set_source_rgb(*_mix(c["face"], _segment_color(c, st, g, i), 0.16))
+        cr.fill()
+
+
+def _digital_dynamic(cr, x, y, r, g, v, look, hist=None):
+    """A big number with the segments that are lit."""
     c, st = look.c, look.s
     gl = st["glow"]
     vmin, vmax, red = g["min"], g["max"], g["red"]
     cr.select_font_face(FONTS[st["font"]], 0, 1)
     over = v is not None and st["red_zone"] and v >= red
     col = c["red"] if over else c["text"]
-    _glow_text(cr, label, x, y - r * 0.62, _fit_text(cr, label, r * 0.14, r * 1.4), c["dim"], gl * 0.5)
     num = _fmt_num(v, g)
     big = _fit_text(cr, num, r * 0.62, r * 1.2)
     unit = g["unit"] if v is not None else ""
@@ -1675,41 +1842,28 @@ def _digital(cr, x, y, r, g, v, look, label, hist):
     _glow_text(cr, num, left, y - r * 0.1, big, col, gl, "left")
     if unit:
         _glow_text(cr, unit, left + n_w + r * 0.06, y + r * 0.04, r * 0.15, c["dim"], gl * 0.5, "left")
-    n = 12
-    sw, gap = (r * 1.5) / n, r * 0.04
-    lit = 0 if v is None else int(round(max(0.0, min(1.0, (v - vmin) / (vmax - vmin))) * n))
-    for i in range(n):
-        seg_red = st["red_zone"] and (vmin + (vmax - vmin) * (i + 0.5) / n) >= red
-        base = c["red"] if seg_red else c["needle"]
-        sx = x - r * 0.75 + i * sw
-        _round_rect(cr, sx + gap / 2, y + r * 0.34, sw - gap, r * 0.2, r * 0.04)
-        if i < lit:
-            _halo_fill(cr, base, r * 0.1, gl)
-            cr.set_source_rgb(*base)
-        else:
-            cr.set_source_rgb(*_mix(c["face"], base, 0.16))
+    lit = 0 if v is None else int(round(max(0.0, min(1.0, (v - vmin) / (vmax - vmin))) * _SEGMENTS))
+    for i in range(lit):
+        base = _segment_color(c, st, g, i)
+        _segment(cr, x, y, r, i)
+        _halo_fill(cr, base, r * 0.1, gl)
+        cr.set_source_rgb(*base)
         cr.fill()
 
 
-def _graph(cr, x, y, r, g, v, look, label, hist):
-    """A line that shows the last minute and a half."""
+def _graph_box(x, y, r):
+    return x - r * 0.78, x + r * 0.78, y - r * 0.38, y + r * 0.62
+
+
+def _graph_static(cr, x, y, r, g, look, label):
+    """The unchanging part of the graph style: the name, the grid and the red-zone line."""
     c, st = look.c, look.s
     gl = st["glow"]
     vmin, vmax, red = g["min"], g["max"], g["red"]
     cr.select_font_face(FONTS[st["font"]], 0, 1)
-    over = v is not None and st["red_zone"] and v >= red
-    txt = _value_text(g, v)
-    value_size = _fit_text(cr, txt, r * 0.2, r * 0.78)
-    cr.set_font_size(value_size)
-    room = r * 1.56 - cr.text_extents(txt).x_advance - r * 0.1        # what is left for the name
-    _glow_text(cr, label, x - r * 0.78, y - r * 0.62, _fit_text(cr, label, r * 0.14, max(room, r * 0.3)),
+    _glow_text(cr, label, x - r * 0.78, y - r * 0.62, _fit_text(cr, label, r * 0.14, r * 0.72),
                c["dim"], gl * 0.5, "left")
-    _glow_text(cr, txt, x + r * 0.78, y - r * 0.62, value_size, c["red"] if over else c["text"], gl, "right")
-    px0, px1, py0, py1 = x - r * 0.78, x + r * 0.78, y - r * 0.38, y + r * 0.62
-
-    def py(val):
-        return py1 - (py1 - py0) * max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
-
+    px0, px1, py0, py1 = _graph_box(x, y, r)
     cr.set_source_rgb(*_mix(c["face"], c["rim"], 0.25))
     cr.set_line_width(r * 0.012)
     for f in (0.0, 0.5, 1.0):
@@ -1717,12 +1871,30 @@ def _graph(cr, x, y, r, g, v, look, label, hist):
         cr.line_to(px1, py1 - (py1 - py0) * f)
     cr.stroke()
     if st["red_zone"] and red < vmax:
+        yr = py1 - (py1 - py0) * max(0.0, min(1.0, (red - vmin) / (vmax - vmin)))
         cr.set_source_rgba(*c["red"], 0.7)
         cr.set_dash([r * 0.05, r * 0.04])
-        cr.move_to(px0, py(red))
-        cr.line_to(px1, py(red))
+        cr.move_to(px0, yr)
+        cr.line_to(px1, yr)
         cr.stroke()
         cr.set_dash([])
+
+
+def _graph_dynamic(cr, x, y, r, g, v, look, hist=None):
+    """A line that shows the last minute and a half, and the current reading."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    over = v is not None and st["red_zone"] and v >= red
+    txt = _value_text(g, v)
+    _glow_text(cr, txt, x + r * 0.78, y - r * 0.62, _fit_text(cr, txt, r * 0.2, r * 0.72),
+               c["red"] if over else c["text"], gl, "right")
+    px0, px1, py0, py1 = _graph_box(x, y, r)
+
+    def py(val):
+        return py1 - (py1 - py0) * max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+
     pts = list(hist or [])[-90:]
     if len(pts) < 2:
         _glow_text(cr, "collecting…", x, y + r * 0.12, r * 0.13, c["dim"], 0)
@@ -1747,15 +1919,70 @@ def _graph(cr, x, y, r, g, v, look, label, hist):
     cr.stroke()
 
 
-_DISPLAYS = {"dial": _dial, "ring": _ring, "bar": _bar, "digital": _digital, "graph": _graph}
+# Each gauge style is two functions: the part that never changes (drawn once into a cached image)
+# and the part that changes with the reading (drawn every time).
+_DISPLAYS = {"dial": (_dial_static, _dial_dynamic), "ring": (_ring_static, _ring_dynamic),
+             "bar": (_bar_static, _bar_dynamic), "digital": (_digital_static, _digital_dynamic),
+             "graph": (_graph_static, _graph_dynamic)}
 
 
-def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False, hist=None):
-    """One gauge inside the square of half-size r around (x, y), in the chosen display style."""
+# The face, rim, glow, picture, ticks and numbers of a gauge never change between readings, and the
+# glow makes them the slow part to draw. They are drawn once into an image and reused; only the
+# reading and the needle are drawn each second. Turn this off to draw everything directly.
+CACHE_LAYERS = True
+LAYER_MARGIN = 1.45          # room around the face for the glow, in units of the dial radius
+_LAYERS = {}
+
+
+def _layer(cr, r, g, look, label, alarm, hot, dpi):
+    """(image, pixels per unit) of the unchanging part of a gauge, or None if it can't be cached."""
+    if not CACHE_LAYERS:
+        return None
+    m = cr.get_matrix()
+    px = math.hypot(m.xx, m.yx) * dpi
+    side = int(math.ceil(2 * r * LAYER_MARGIN * px))
+    if not 4 <= side <= 3000:
+        return None
+    st = look.s
+    key = (g["key"], g["min"], g["max"], g["red"], g["scale"], g["unit"], r, round(px, 3), look.sig, label,
+           alarm, hot, PICTURES.stamp(st["image"]))
+    surf = _LAYERS.get(key)
+    if surf is None:
+        if len(_LAYERS) > 80:
+            _LAYERS.clear()
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, side, side)
+        c2 = cairo.Context(surf)
+        c2.scale(px, px)
+        c2.translate(r * LAYER_MARGIN, r * LAYER_MARGIN)
+        _frame(c2, 0, 0, r, look, alarm, hot)
+        c2.select_font_face(FONTS[st["font"]], 0, 1)
+        _DISPLAYS[st["display"]][0](c2, 0, 0, r, g, look, label)
+        _LAYERS[key] = surf
+    return surf
+
+
+def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False, hist=None, dpi=1):
+    """One gauge inside the square of half-size r around (x, y), in the chosen display style.
+    dpi: the screen's scale factor (2 on a high-resolution screen), so cached images stay sharp."""
     hot = alarm and blink
-    _frame(cr, x, y, r, look, alarm, hot)
+    label = label or g["label"]
+    display = look.s["display"]
+    surf = _layer(cr, r, g, look, label, alarm, hot, dpi)
+    if surf is not None:
+        ux, uy = cr.user_to_device(x - r * LAYER_MARGIN, y - r * LAYER_MARGIN)
+        cr.save()
+        cr.identity_matrix()
+        cr.translate(round(ux * dpi) / dpi, round(uy * dpi) / dpi)    # land on whole screen pixels
+        cr.scale(1.0 / dpi, 1.0 / dpi)
+        cr.set_source_surface(surf, 0, 0)
+        cr.paint()
+        cr.restore()
+    else:
+        _frame(cr, x, y, r, look, alarm, hot)
+        cr.select_font_face(FONTS[look.s["font"]], 0, 1)
+        _DISPLAYS[display][0](cr, x, y, r, g, look, label)
     cr.select_font_face(FONTS[look.s["font"]], 0, 1)
-    _DISPLAYS[look.s["display"]](cr, x, y, r, g, v, look, label or g["label"], hist)
+    _DISPLAYS[display][1](cr, x, y, r, g, v, look, hist)
 
 
 BASE_W = 540
@@ -1791,7 +2018,7 @@ def _fit(w, h, bw, bh):
     return s, (w - bw * s) / 2.0, (h - bh * s) / 2.0
 
 
-def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title, history=None):
+def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title, history=None, dpi=1):
     look0 = theme.look(None)
     _draw_background(cr, w, h, look0)
     s, ox, oy = _fit(w, h, BASE_W, bh)
@@ -1806,19 +2033,19 @@ def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title,
         key = g["key"]
         on = key in alarms or (key + "_stop") in alarms
         draw_gauge(cr, x, y, r, g, values.get(key), theme.look(key),
-                   theme.label(key) or labels.get(key), on, blink, (history or {}).get(key))
+                   theme.label(key) or labels.get(key), on, blink, (history or {}).get(key), dpi)
     cr.select_font_face(TITLE_FONTS[look0.s["font"]], 0, 1)
     cr.set_font_size(30)
     cr.set_source_rgb(*look0.c["red"])
     _centered(cr, (theme.title or TITLE).upper(), BASE_W / 2, bh - 35)
 
 
-def draw_solo(cr, w, h, g, v, look, label, alarm, blink, hist=None):
+def draw_solo(cr, w, h, g, v, look, label, alarm, blink, hist=None, dpi=1):
     _draw_background(cr, w, h, look)
     s = min(w, h) / 230.0
     cr.translate(w / 2.0, h / 2.0)
     cr.scale(s, s)
-    draw_gauge(cr, 0, 0, 100, g, v, look, label, alarm, blink, hist)
+    draw_gauge(cr, 0, 0, 100, g, v, look, label, alarm, blink, hist, dpi)
 
 
 STRIP_CELL_W, STRIP_CELL_H = 100, 64
@@ -1913,9 +2140,16 @@ HYSTERESIS = {"board_temp": 3}      # how far below the limit a reading must fal
 
 def alert_rule(g):
     """(limit, name, unit) if this gauge raises an alert, else None."""
-    if g and (g.get("kind") == "temp" or g["key"] == "ram"):
+    if g and not g.get("junk") and (g.get("kind") == "temp" or g["key"] == "ram"):
         return g["red"], g.get("alert_name") or g["label"], g["unit"]
     return None
+
+
+def _plausible(g, v):
+    """False for a reading that is a glitch rather than a measurement (0, -128, 255...)."""
+    if g.get("kind") == "temp":
+        return -40 < v < 130 and v != 0
+    return True
 
 
 SOUND_CMDS = [
@@ -1989,7 +2223,7 @@ class Alerts:
             if g is None or val is None:
                 continue
             rule = alert_rule(g)
-            if rule:
+            if rule and _plausible(g, val):
                 limit, name, unit = rule
                 self._check(key, val >= limit, val < limit - HYSTERESIS.get(key, 5),
                             f"{name} is critical",
@@ -2187,11 +2421,17 @@ class PeerWatcher:
 
 # ---------------------------------------------------------------- windows
 def _alert(parent, message, detail=""):
-    if HAS_NEW_DIALOGS:
+    """A small message box. Uses the GTK 4.10 dialog when there is one, the older one otherwise."""
+    if HAS_ALERT_DIALOG:
         d = Gtk.AlertDialog()
         d.set_message(message)
         d.set_detail(detail)
         d.show(parent)
+    else:
+        dlg = Gtk.MessageDialog(transient_for=parent, modal=True, message_type=Gtk.MessageType.INFO,
+                                buttons=Gtk.ButtonsType.OK, text=message, secondary_text=detail)
+        dlg.connect("response", lambda d, _r: d.destroy())
+        dlg.present()
 
 
 def _menu_item(label, action, target=None):
@@ -2219,6 +2459,7 @@ class BaseWindow(Gtk.ApplicationWindow):
         self.app = app
         self.values = {}
         self.history = {}                 # the last ~90 readings of each gauge, for the Graph style
+        self._snap = None                 # what is on screen, to skip redraws that change nothing
         self.blink = False
         self.test_flash = set()
         self.want = frozenset()
@@ -2263,10 +2504,17 @@ class BaseWindow(Gtk.ApplicationWindow):
                 self.history.setdefault(key, deque(maxlen=90)).append(vals[key])
         self.alerts.update(vals, self.alert_keys())
         self._update_badge(vals)
-        self.area.queue_draw()
+        shown = self.shown_keys()
+        snap = tuple((k, _fmt_num(vals.get(k), gauge_by_key(k)) if gauge_by_key(k) else None)
+                     for k in sorted(shown))
+        graphs = any(self.app.theme.look(k).s["display"] == "graph" for k in shown)
+        if snap != self._snap or graphs or self.alerts.active:    # skip frames that would look identical
+            self._snap = snap
+            self.area.queue_draw()
 
     def _theme_changed(self, external=False):
         if not self._closed:
+            self._snap = None
             self.area.queue_draw()
 
     def _flash(self):
@@ -2330,8 +2578,8 @@ class BaseWindow(Gtk.ApplicationWindow):
             self.app.notify("pin", f"{name} pinned", "It is now on your dock.", False)
         else:
             _alert(self, "This desktop can't be pinned for you",
-                   f"Open your app menu, find \"{name}\", right-click it and choose "
-                   "Add to Favorites (or Pin to Dash).")
+                   f"A launcher for \"{name}\" is now in your app menu. Find it there, right-click it and "
+                   "choose Add to Favorites, Add to Panel or Pin to Dash, whichever your desktop offers.")
 
 
 class DeckWindow(BaseWindow):
@@ -2421,7 +2669,7 @@ class DeckWindow(BaseWindow):
             return
         if not DEMO:
             ensure_launcher("gauge", key, self.app.display_label(key), self.app.theme)
-        if not spawn_self("--gauge", key):
+        if not spawn_self("--gauge", key, "--owned"):
             _alert(self, "Couldn't open that gauge", "GaugeDeck could not start a new window.")
             return
         self.pending[key] = True
@@ -2493,7 +2741,8 @@ class DeckWindow(BaseWindow):
     def _draw(self, _area, cr, w, h):
         placed, bh = self._layout_cache
         draw_deck(cr, w, h, placed, bh, self.values, {}, self.app.theme,
-                  self.alerts.active | self.test_flash, self.blink, TITLE, self.history)
+                  self.alerts.active | self.test_flash, self.blink, TITLE, self.history,
+                  self.area.get_scale_factor())
 
     def _on_close(self, win):
         self.peers.close()
@@ -2579,10 +2828,23 @@ class GaugeWindow(OverlayWindow):
         self.key = key
         self.badge_key = key
         self.g = gauge_by_key(key)
+        self.keep_popped = False         # True when closing only because the deck closed
+        self.deck_seen = False
         super().__init__(app, f"{APP_NAME} - {app.display_label(key)}", key, (260, 260))
         _add_action(self, "pin", self.pin)
         state_set_popped(key, True)
+        self.peers = PeerWatcher(self._peer) if app.owned else None
         self.begin()
+
+    def _peer(self, who, up):
+        """Opened from the deck: close together with it (and come back next time the deck opens)."""
+        if who != "deck":
+            return
+        if up:
+            self.deck_seen = True
+        elif self.deck_seen and not self._closed:
+            self.keep_popped = True
+            self.close()
 
     def shown_keys(self):
         return {self.key}
@@ -2591,7 +2853,7 @@ class GaugeWindow(OverlayWindow):
         draw_solo(cr, w, h, self.g, self.values.get(self.key), self.app.theme.look(self.key),
                   self.app.display_label(self.key), self.key in self.alerts.active
                   or self.key + "_stop" in self.alerts.active or self.key in self.test_flash, self.blink,
-                  self.history.get(self.key))
+                  self.history.get(self.key), self.area.get_scale_factor())
 
     def context_menu(self, x, y):
         extra = Gio.Menu()
@@ -2612,7 +2874,10 @@ class GaugeWindow(OverlayWindow):
 
     def _on_close(self, win):
         self.remember()
-        state_set_popped(self.key, False)
+        if not self.keep_popped:
+            state_set_popped(self.key, False)
+        if self.peers:
+            self.peers.close()
         return super()._on_close(win)
 
 
@@ -2717,6 +2982,7 @@ class CustomizeWindow(Gtk.Window):
                          destroy_with_parent=True, default_width=720, default_height=620)
         self.app, self.theme = app, app.theme
         self.scope = None
+        self._native = None
         self._loading = False
         self.keys = [None] + [g["key"] for g in enabled_gauges()]
 
@@ -2776,9 +3042,13 @@ class CustomizeWindow(Gtk.Window):
         row += 1
         self.color_btns = {}
         for name, text in COLOR_KEYS:
-            dlg = Gtk.ColorDialog()
-            dlg.set_with_alpha(False)
-            btn = Gtk.ColorDialogButton(dialog=dlg)
+            if HAS_COLOR_DIALOG:
+                dlg = Gtk.ColorDialog()
+                dlg.set_with_alpha(False)
+                btn = Gtk.ColorDialogButton(dialog=dlg)
+            else:                                    # GTK older than 4.10
+                btn = Gtk.ColorButton()
+                btn.set_use_alpha(False)
             btn.connect("notify::rgba", self._color_changed, name)
             self.color_btns[name] = btn
             add(text, btn)
@@ -2923,15 +3193,29 @@ class CustomizeWindow(Gtk.Window):
             self.theme.set(self.scope, "style", dim, round(scale.get_value(), 2))
 
     def _choose_picture(self, _btn, img):
-        dlg = Gtk.FileDialog(title="Choose a picture")
         flt = Gtk.FileFilter()
         flt.set_name("Pictures")
         flt.add_mime_type("image/*")
-        store = Gio.ListStore.new(Gtk.FileFilter)
-        store.append(flt)
-        dlg.set_filters(store)
-        dlg.set_default_filter(flt)
-        dlg.open(self, None, self._picture_chosen, img)
+        if HAS_FILE_DIALOG:
+            dlg = Gtk.FileDialog(title="Choose a picture")
+            store = Gio.ListStore.new(Gtk.FileFilter)
+            store.append(flt)
+            dlg.set_filters(store)
+            dlg.set_default_filter(flt)
+            dlg.open(self, None, self._picture_chosen, img)
+        else:                                        # GTK older than 4.10
+            self._native = Gtk.FileChooserNative.new("Choose a picture", self, Gtk.FileChooserAction.OPEN,
+                                                     "_Open", "_Cancel")
+            self._native.add_filter(flt)
+            self._native.connect("response", self._picture_response, img)
+            self._native.show()
+
+    def _picture_response(self, dlg, response, img):
+        path = dlg.get_file().get_path() if response == Gtk.ResponseType.ACCEPT and dlg.get_file() else None
+        self._native = None
+        if path:
+            self.theme.set(self.scope, "style", img, path)
+            self._refresh()
 
     def _picture_chosen(self, dlg, result, img):
         try:
@@ -2972,7 +3256,8 @@ class CustomizeWindow(Gtk.Window):
 class SensorsWindow(Gtk.Window):
     """Every sensor GaugeDeck found on this computer: what it is, what it reads now, and a switch
     to show it as a gauge."""
-    ORDER = ("CPU", "GPU", "Fans", "Storage", "Board", "Power and voltage", "System", "Other")
+    ORDER = ("CPU", "GPU", "Fans", "Storage", "Board", "Power and voltage", "System", "Other",
+             "Looks unconnected")
 
     def __init__(self, app, parent):
         super().__init__(title="Sensors", transient_for=parent, destroy_with_parent=True,
@@ -2995,7 +3280,8 @@ class SensorsWindow(Gtk.Window):
         scroller.set_child(lst)
         groups = {}
         for s in REG.all():
-            groups.setdefault(s["group"] if s["group"] in self.ORDER else "Other", []).append(s)
+            name = "Looks unconnected" if s.get("junk") else (s["group"] if s["group"] in self.ORDER else "Other")
+            groups.setdefault(name, []).append(s)
         for name in self.ORDER:
             if name not in groups:
                 continue
@@ -3034,7 +3320,7 @@ class SensorsWindow(Gtk.Window):
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         text.set_hexpand(True)
         name = Gtk.Label(label=s["name"], xalign=0, wrap=True)
-        sub = Gtk.Label(label=f"{self._source_text(s)}", xalign=0)
+        sub = Gtk.Label(label=self._source_text(s) + (f" - {s['junk']}" if s.get("junk") else ""), xalign=0, wrap=True)
         sub.add_css_class("dim-label")
         sub.add_css_class("caption")
         text.append(name)
@@ -3092,11 +3378,11 @@ class SensorsWindow(Gtk.Window):
 
 
 class GaugeApp(Gtk.Application):
-    def __init__(self, mode="deck", key=None, test_alert=False):
+    def __init__(self, mode="deck", key=None, test_alert=False, owned=False):
         # one program per window kind: clicking its icon again just brings it forward
         app_id = {"deck": APP_ID, "gauge": f"{APP_ID}.{key}", "strip": f"{APP_ID}.strip"}[mode]
         super().__init__(application_id=app_id)
-        self.mode, self.key, self.test_alert = mode, key, test_alert
+        self.mode, self.key, self.test_alert, self.owned = mode, key, test_alert, owned
         self.theme = Theme()
         self.sensors = DemoSensors(CATALOG) if DEMO else Sensors(CATALOG)
         self.customize_win = None
@@ -3107,7 +3393,7 @@ class GaugeApp(Gtk.Application):
     def do_startup(self):
         Gtk.Application.do_startup(self)
         _add_action(self, "customize", self.show_customize, param=True)
-        _add_action(self, "close-gauge", self.quit)
+        _add_action(self, "close-gauge", self.close_windows)
         _add_action(self, "about", self.show_about)
         _add_action(self, "sensors", self.show_sensors)
         try:
@@ -3162,10 +3448,12 @@ class GaugeApp(Gtk.Application):
         except GLib.Error:
             pass
 
+    def close_windows(self):
+        """Close every window of this program the normal way (so a gauge records that it is back in the deck)."""
+        for w in list(self.get_windows()):
+            w.close()
+
     def show_customize(self, scope=""):
-        if not HAS_NEW_DIALOGS:
-            _alert(self.props.active_window, "Customize needs a newer GTK", "GTK 4.10 or later is required.")
-            return
         if self.customize_win is None:
             self.customize_win = CustomizeWindow(self, self.props.active_window)
         self.customize_win.select_scope(scope or None)
@@ -3197,12 +3485,13 @@ def print_sensors():
         v = vals.get(s["key"])
         reading = f"{_fmt_num(v, s)} {s['unit']}" if v is not None else "--"
         src = SensorsWindow._source_text(s)
-        print(f"{s['key']:28} {'yes' if s['key'] in shown else '':5} {reading:>12}  {s['name']}  ({src})")
+        note = f"  [looks unconnected: {s['junk']}]" if s.get("junk") else ""
+        print(f"{s['key']:28} {'yes' if s['key'] in shown else '':5} {reading:>12}  {s['name']}  ({src}){note}")
     return 0
 
 
 def main(argv):
-    mode, key, test_alert = "deck", None, False
+    mode, key, test_alert, owned = "deck", None, False, False
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -3226,6 +3515,8 @@ def main(argv):
             test_alert = True
         elif a == "--strip":
             mode = "strip"
+        elif a == "--owned":
+            owned = True
         elif a == "--gauge" and i + 1 < len(argv):
             mode, key = "gauge", argv[i + 1]
             i += 1
@@ -3234,7 +3525,7 @@ def main(argv):
         elif a not in ("--demo",):
             return "GaugeDeck: unknown option '%s'" % a
         i += 1
-    return GaugeApp(mode, key, test_alert).run([argv[0]])
+    return GaugeApp(mode, key, test_alert, owned).run([argv[0]])
 
 
 if __name__ == "__main__":

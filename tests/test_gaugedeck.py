@@ -3,6 +3,7 @@ Run with:  python3 -m unittest discover -s tests -v"""
 import importlib.util
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,8 @@ gd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gd)
 
 # the real PCI name list may not exist on the machine running the tests
-gd._PCI_IDS = {("1002", "73bf"): "Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"}
+gd._PCI_IDS = {("1002", "73bf"): "Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]",
+               ("1002", "67df"): "Ellesmere [Radeon RX 470/480/570/570X/580/580X/590]"}
 
 
 def make_gauge(key, big=False, red=80, vmax=100, unit="°C", **kw):
@@ -238,7 +240,8 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertTrue(self.by["drivetemp_temp1"]["default"])
 
     def test_the_graphics_card_is_named_from_the_pci_list(self):
-        self.assertIn("Radeon RX 6800", self.by["amdgpu_junction"]["name"])
+        # one id covers several models, so the name keeps all of them instead of guessing the first
+        self.assertIn("Radeon RX 6800/6800 XT / 6900 XT", self.by["amdgpu_junction"]["name"])
         self.assertEqual(self.by["amdgpu_junction"]["red"], 110)
         for key in ("amdgpu_junction", "amdgpu_mem", "amdgpu_power", "amdgpu_sclk", "amdgpu_load", "amdgpu_vram"):
             self.assertFalse(self.by[key]["default"], key)
@@ -419,6 +422,416 @@ class RegistryTests(unittest.TestCase):
             f.write('{"show": ["cpu_temp", "gone_sensor"]}')
         reg = gd.Registry(self.cat, self.path)
         self.assertEqual([g["key"] for g in reg.enabled()], ["cpu_temp"])
+
+
+
+def foundry_nvidia():
+    """What nvidia-smi reports for the headless Tesla P100: no fan (Fan N/A)."""
+    return {0: {"name": "Tesla P100-PCIE-16GB", "temperature.gpu": 34.0, "power.draw": 28.35,
+                "power.limit": 250.0, "fan.speed": None, "utilization.gpu": 0.0, "memory.used": 0.0,
+                "memory.total": 16280.0, "clocks.sm": 1328.0}}
+
+
+class FoundryTests(unittest.TestCase):
+    """The JGINYUE X99 Titanium D4 board (nct6779) reports many sensors with nothing connected."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tempfile.mkdtemp(prefix="gaugedeck-foundry-")
+        fake_sysfs.build_foundry(cls.root)
+        cls.cat = gd.discover(cls.root, nvidia=foundry_nvidia())
+        cls.by = {s["key"]: s for s in cls.cat}
+
+    def test_only_the_ten_real_gauges_are_on_by_default(self):
+        reg = gd.Registry(self.cat, os.path.join(_TMP, "foundry-sensors.json"))
+        self.assertEqual(sorted(g["key"] for g in reg.enabled()), sorted([
+            "cpu_temp", "cpu_load", "gpu_temp", "fan1", "fan2", "gpu_fan", "ram", "board_temp",
+            "nv_temp", "nv_power"]))
+
+    def test_both_graphics_cards_show(self):
+        self.assertTrue(self.by["gpu_temp"]["src"][1].endswith("hwmon2/temp1_input"))   # the RX 580
+        self.assertTrue(self.by["gpu_temp"]["default"] and self.by["gpu_fan"]["default"])
+        self.assertEqual(self.by["nv_temp"]["label"], "P100 TEMP")                      # the Tesla P100
+        self.assertTrue(self.by["nv_temp"]["default"] and self.by["nv_power"]["default"])
+        self.assertNotIn("nv_fan", self.by)                  # Pascal compute card: Fan N/A
+
+    def test_the_rx_580_is_not_mistaken_for_an_rx_470(self):
+        name = self.by["amdgpu_power"]["name"]
+        self.assertIn("470/480/570/570X/580/580X/590", name)
+
+    def test_unconnected_temperatures_are_flagged_and_off(self):
+        for key in ("nct6779_auxtin0", "nct6779_auxtin1", "nct6779_auxtin2", "nct6779_auxtin3",
+                    "nct6779_peci_agent_0", "nct6779_pch_chip_cpu_max_temp", "nct6779_pch_chip_temp",
+                    "nct6779_pch_cpu_temp", "nct6779_pch_mch_temp"):
+            self.assertTrue(self.by[key]["junk"], key)
+            self.assertFalse(self.by[key]["default"], key)
+
+    def test_real_board_temperatures_are_not_flagged(self):
+        for key in ("board_temp", "nct6779_cputin", "nct6779_smbusmaster_0", "cpu_temp"):
+            self.assertEqual(self.by[key]["junk"], "", key)
+
+    def test_voltages_are_off_and_the_dead_ones_are_flagged(self):
+        for n in range(15):
+            s = self.by.get(f"nct6779_in{n}")
+            if s is None:
+                continue
+            self.assertFalse(s["default"], n)
+            self.assertEqual(bool(s["junk"]), n in (1, 4, 5, 6, 9, 10, 11, 12, 13, 14), n)
+        self.assertEqual(self.by["nct6779_in0"]["junk"], "")        # Vcore: odd but real, never alerts
+
+    def test_there_are_no_intrusion_sensors(self):
+        self.assertFalse([k for k in self.by if "intrusion" in k])
+
+    def test_fans_with_nothing_connected_are_off(self):
+        for n in (3, 4, 5):
+            self.assertFalse(self.by[f"nct6779_fan{n}"]["default"], n)
+        self.assertTrue(self.by["fan1"]["default"] and self.by["fan2"]["default"])
+        self.assertNotIn("fan3", self.by)
+
+    def _alerts(self, sent):
+        self.addCleanup(setattr, gd, "REG", gd.REG)
+        gd.REG = gd.Registry(self.cat, os.path.join(_TMP, "foundry-alerts.json"))
+        gd.play_alarm = lambda: None
+        gd.CFG["alerts"] = "on"
+        alerts = gd.Alerts(lambda k, t, b, u: sent.append((k, t)), lambda k: k)
+        alerts.hold = 2
+        return alerts
+
+    def test_nothing_unconnected_ever_raises_an_alert(self):
+        sent = []
+        alerts = self._alerts(sent)
+        values = gd.Sensors(self.cat).read_all()              # what the board really reports
+        everything = {s["key"] for s in self.cat}
+        for _ in range(12):
+            alerts.update(values, everything)
+        self.assertEqual(sent, [])
+
+    def test_a_flagged_sensor_stays_quiet_even_when_switched_on_and_very_hot(self):
+        sent = []
+        alerts = self._alerts(sent)
+        for _ in range(6):
+            alerts.update({"nct6779_auxtin1": 117}, {"nct6779_auxtin1"})
+        self.assertEqual(sent, [])
+
+    def test_a_real_sensor_still_alarms(self):
+        sent = []
+        alerts = self._alerts(sent)
+        for _ in range(6):
+            alerts.update({"cpu_temp": 96}, {"cpu_temp"})
+        self.assertEqual([t for _k, t in sent], ["CPU temperature is critical"])
+
+    def test_a_glitch_reading_on_a_real_sensor_does_not_alarm(self):
+        sent = []
+        alerts = self._alerts(sent)
+        for bad in (255, 0, -128, 65535):
+            for _ in range(5):
+                alerts.update({"cpu_temp": bad}, {"cpu_temp"})
+        self.assertEqual(sent, [])
+
+
+class HeadlessNvidiaTests(unittest.TestCase):
+    """No /proc/driver/nvidia (headless server driver): the card is found through nvidia-smi alone."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.counter = os.path.join(self.bin, "calls")
+        exe = os.path.join(self.bin, "nvidia-smi")
+        with open(exe, "w") as f:
+            f.write(f"#!/bin/sh\necho x >> '{self.counter}'\necho '{fake_sysfs.P100_LINE}'\n")
+        os.chmod(exe, os.stat(exe).st_mode | stat.S_IEXEC)
+        self.old = os.environ["PATH"]
+        os.environ["PATH"] = self.bin + os.pathsep + self.old
+        self.addCleanup(os.environ.__setitem__, "PATH", self.old)
+        self.root = tempfile.mkdtemp()
+        fake_sysfs.build_foundry(self.root)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "proc/driver/nvidia")))
+
+    def calls(self):
+        with open(self.counter) as f:
+            return len(f.read().split())
+
+    def test_the_p100_is_found_next_to_the_rx_580_without_proc_driver_nvidia(self):
+        by = {s["key"]: s for s in gd.discover(self.root)}        # asks nvidia-smi itself
+        self.assertTrue(by["gpu_temp"]["default"])                # the RX 580
+        self.assertEqual(by["nv_temp"]["label"], "P100 TEMP")     # the P100
+        self.assertNotIn("nv_fan", by)
+
+    def test_readings_come_from_nvidia_smi(self):
+        sensors = gd.Sensors(gd.discover(self.root))
+        v = sensors.read_all(["nv_temp", "nv_power", "gpu_temp"])
+        self.assertEqual(v["nv_temp"], 34.0)
+        self.assertEqual(v["nv_power"], 28.35)
+        self.assertEqual(v["gpu_temp"], 41.0)
+
+    def test_nvidia_smi_is_not_started_every_second(self):
+        sensors = gd.Sensors(gd.discover(self.root))
+        before = self.calls()
+        for _ in range(10):
+            sensors.read_all(["nv_temp", "nv_power"])
+        self.assertEqual(self.calls() - before, 1)               # one call, not ten
+
+    def test_a_failed_call_is_retried_next_time(self):
+        sensors = gd.Sensors(gd.discover(self.root))
+        sensors.read_all(["nv_temp"])
+        os.remove(os.path.join(self.bin, "nvidia-smi"))
+        sensors._nv = ({}, 0.0)                                  # as if the cache had gone stale
+        self.assertIsNone(sensors.read_all(["nv_temp"])["nv_temp"])
+
+
+class DellTests(unittest.TestCase):
+    """The MX Linux test box: a Dell with the dell_smm chip."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = tempfile.mkdtemp(prefix="gaugedeck-dell-")
+        fake_sysfs.build_dell(root)
+        cls.by = {s["key"]: s for s in gd.discover(root, nvidia={})}
+
+    def test_dell_fan_names_are_used_and_fit(self):
+        labels = [self.by[f"fan{i}"]["label"] for i in range(1, 6)]
+        self.assertEqual(labels, ["CPU FAN", "BOARD FAN", "VIDEO FAN", "PSU FAN", "CHIPSET FAN"])
+        self.assertEqual(self.by["fan4"]["name"], "Power Supply Fan speed")
+        self.assertTrue(all(len(x) <= 12 for x in labels))
+
+    def test_the_board_gauge_does_not_repeat_the_cpu_temperature(self):
+        self.assertNotIn("board_temp", self.by)
+        self.assertEqual(self.by["dell_smm_cpu"]["name"], "Dell CPU temperature")
+        self.assertFalse(self.by["dell_smm_cpu"]["default"])
+
+    def test_the_drive_is_named(self):
+        self.assertIn("KINGSTON", self.by["nvme_composite"]["name"])
+
+
+class OldSettingsTests(unittest.TestCase):
+    """Settings files written by older versions keep working."""
+
+    def load(self, text, raw=False):
+        path = os.path.join(_TMP, "old-config")
+        with open(path, "wb" if raw else "w") as f:
+            f.write(text)
+        return gd.load_config(path)
+
+    def test_the_config_from_version_1_2_1(self):
+        cfg = self.load("title=THE FOUNDRY\nscale=0.6\nnv_temp_alert=88\n")
+        self.assertEqual((cfg["title"], cfg["scale"], cfg["nv_temp_alert"]), ("THE FOUNDRY", "0.6", "88"))
+        self.assertEqual(cfg["alerts"], "on")                      # everything else keeps its default
+
+    def test_the_readme_example_with_notes_after_the_value(self):
+        cfg = self.load("title=MY RIG\nscale=0.6      # 0.3 = tiny, 1.0 = large\n")
+        self.assertEqual(cfg["scale"], "0.6")
+
+    def test_a_hash_inside_a_title_is_kept(self):
+        self.assertEqual(self.load("title=RIG #1\n")["title"], "RIG #1")
+
+    def test_windows_line_endings_a_bom_and_quotes(self):
+        cfg = self.load('\ufefftitle="THE FOUNDRY"\r\nscale=0.5\r\n')
+        self.assertEqual((cfg["title"], cfg["scale"]), ("THE FOUNDRY", "0.5"))
+
+    def test_bytes_that_are_not_text_do_not_crash(self):
+        cfg = self.load(b"title=CAF\xc9 RIG\n\xff\xfe\nscale=0.7\n", raw=True)
+        self.assertEqual(cfg["scale"], "0.7")
+
+    def test_a_missing_file_gives_the_defaults(self):
+        self.assertEqual(gd.load_config(os.path.join(_TMP, "nope"))["scale"], "0.6")
+
+    def test_nonsense_numbers_fall_back_instead_of_crashing(self):
+        old = dict(gd.CFG)
+        self.addCleanup(lambda: (gd.CFG.clear(), gd.CFG.update(old)))
+        gd.CFG["cpu_temp_alert"] = "hot"
+        self.assertEqual(gd._num_cfg("cpu_temp_alert", 80), 80.0)
+
+    def test_the_old_alert_limit_still_sets_the_red_zone(self):
+        code = ("import sys; sys.argv=['gd']; import importlib.util as u;"
+                "s=u.spec_from_file_location('g', %r); g=u.module_from_spec(s); s.loader.exec_module(g);"
+                "print(g.discover(%r, nvidia={0: %r})[0]['red'])")
+        root = tempfile.mkdtemp()
+        fake_sysfs.build_foundry(root)
+        cfgdir = tempfile.mkdtemp()
+        with open(os.path.join(cfgdir, "config"), "w") as f:
+            f.write("cpu_temp_alert=70\nnv_temp_alert=88\n")
+        out = subprocess.run([sys.executable, "-c", code % (os.path.join(os.path.dirname(__file__), "..", "gaugedeck.py"),
+                                                           root, foundry_nvidia()[0] and foundry_nvidia())],
+                             env=dict(os.environ, GAUGEDECK_CONFIG_DIR=cfgdir), capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip().split()[-1], "70.0")
+
+
+class PictureSafetyTests(unittest.TestCase):
+    def draw(self, **style):
+        import cairo
+        theme = gd.Theme(os.path.join(_TMP, "picsafe.json"))
+        for k, v in style.items():
+            theme.set(None, "style", k, v)
+        placed, bh = gd.deck_layout(ORIGINAL_EIGHT)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 300, 400)
+        cr = cairo.Context(surf)
+        gd.draw_deck(cr, 300, 400, placed, bh, {}, {}, theme, set(), False, "T")
+        gd.draw_solo(cairo.Context(surf), 200, 200, ORIGINAL_EIGHT[0], 50, theme.look(None), "X", False, False)
+
+    def test_a_picture_that_was_moved_or_deleted_does_not_break_drawing(self):
+        self.draw(bg_image="/no/such/place/wallpaper.jpg", image="/gone/dial.png")
+
+    def test_a_folder_or_empty_file_instead_of_a_picture(self):
+        empty = os.path.join(_TMP, "empty.png")
+        open(empty, "w").close()
+        self.draw(bg_image=_TMP, image=empty)
+
+    def test_a_picture_that_is_deleted_after_it_was_shown(self):
+        import cairo
+        pic = os.path.join(_TMP, "soon-gone.png")
+        s = cairo.ImageSurface(cairo.FORMAT_RGB24, 20, 20)
+        s.write_to_png(pic)
+        self.draw(bg_image=pic, image=pic)
+        os.remove(pic)
+        self.draw(bg_image=pic, image=pic)
+
+
+class RepoFileTests(unittest.TestCase):
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def path(self, name):
+        return os.path.join(self.ROOT, name)
+
+    def test_the_scripts_are_executable(self):
+        for name in ("install.sh", "uninstall.sh", "gaugedeck.py"):
+            self.assertTrue(os.access(self.path(name), os.X_OK), name)
+
+    def test_git_records_them_as_executable(self):
+        out = subprocess.run(["git", "ls-files", "-s", "install.sh", "uninstall.sh", "gaugedeck.py"],
+                             cwd=self.ROOT, capture_output=True, text=True)
+        if out.returncode != 0 or not out.stdout:
+            self.skipTest("not a git checkout")
+        for line in out.stdout.splitlines():
+            self.assertTrue(line.startswith("100755"), line)
+
+    def test_the_scripts_parse_and_the_readme_says_sh_install(self):
+        for name in ("install.sh", "uninstall.sh"):
+            self.assertEqual(subprocess.run(["sh", "-n", self.path(name)]).returncode, 0, name)
+        with open(self.path("README.md")) as f:
+            self.assertIn("sh install.sh", f.read())
+
+    def test_the_version_matches_the_app_info_file(self):
+        with open(self.path("io.github.cyoulater.GaugeDeck.metainfo.xml")) as f:
+            tree = ET.parse(f)
+        releases = tree.getroot().find("releases")
+        self.assertEqual(releases[0].get("version"), gd.VERSION)
+
+    def test_uninstall_removes_what_the_update_added(self):
+        with open(self.path("uninstall.sh")) as f:
+            text = f.read()
+        for needle in ("GaugeDeck.*.desktop", "GaugeDeck.*.svg", ".config/gaugedeck", "--remove-launchers"):
+            self.assertIn(needle, text)
+
+    def test_no_libadwaita(self):
+        with open(self.path("gaugedeck.py")) as f:
+            self.assertNotIn("Adw", f.read())
+
+    def test_older_gtk_falls_back_to_the_older_dialogs(self):
+        code = ("import sys; sys.argv=['gd']; import importlib.util as u;"
+                "s=u.spec_from_file_location('g', %r); g=u.module_from_spec(s); s.loader.exec_module(g);"
+                "print(g.HAS_COLOR_DIALOG, g.HAS_ALERT_DIALOG, g.HAS_FILE_DIALOG)")
+        out = subprocess.run([sys.executable, "-c", code % self.path("gaugedeck.py")],
+                             env=dict(os.environ, GAUGEDECK_OLD_GTK="1", GAUGEDECK_CONFIG_DIR=_TMP),
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip().split()[-3:], ["False", "False", "False"])
+
+
+
+class LayerCacheTests(unittest.TestCase):
+    """The unchanging part of each gauge is drawn once and reused. It must look the same as drawing
+    everything directly, and it must never show an out-of-date look."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gauges = gd.enabled_gauges() or [make_gauge("cpu_temp", True)]
+        cls.gauges = [make_gauge("cpu_temp", True), make_gauge("cpu_load", True, 90, unit="%"),
+                      make_gauge("fan1", red=2200, vmax=2500, unit="RPM", scale=1000), make_gauge("ram", unit="%")]
+        cls.vals = {"cpu_temp": 62, "cpu_load": 41, "fan1": 1300, "ram": 55}
+
+    def tearDown(self):
+        gd.CACHE_LAYERS = True
+        gd._LAYERS.clear()
+
+    def render(self, theme, cached, dpi=1, hot=False):
+        import cairo
+        gd.CACHE_LAYERS = cached
+        placed, bh = gd.deck_layout(self.gauges)
+        w, h = 300, int(bh * 0.55)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w * dpi, h * dpi)
+        surf.set_device_scale(dpi, dpi)
+        gd.draw_deck(cairo.Context(surf), w, h, placed, bh, self.vals, {}, theme,
+                     {"cpu_temp"} if hot else set(), hot, "T", {}, dpi)
+        return bytes(surf.get_data())
+
+    @staticmethod
+    def difference(a, b):
+        mean = sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+        far = sum(1 for x, y in zip(a, b) if abs(x - y) > 48) / len(a) * 100
+        return mean, far
+
+    def test_cached_drawing_matches_direct_drawing(self):
+        for preset in gd.PRESETS:
+            theme = gd.Theme(os.path.join(_TMP, "cache.json"))
+            theme.apply_preset(None, preset)
+            for dpi in (1, 2):
+                for hot in (False, True):
+                    gd._LAYERS.clear()
+                    mean, far = self.difference(self.render(theme, True, dpi, hot), self.render(theme, False, dpi, hot))
+                    self.assertLess(mean, 6, (preset, dpi, hot))
+                    self.assertLess(far, 6, (preset, dpi, hot))
+
+    def test_a_changed_look_is_not_served_from_the_cache(self):
+        theme = gd.Theme(os.path.join(_TMP, "cache2.json"))
+        before = self.render(theme, True)
+        theme.set(None, "style", "glow", 1.0)
+        theme.set(None, "colors", "rim", "#ff00aa")
+        after = self.render(theme, True)
+        self.assertGreater(self.difference(before, after)[0], 3)                  # it really changed
+        self.assertLess(self.difference(after, self.render(theme, False))[0], 6)  # and matches a fresh draw
+
+    def test_changed_limits_and_names_are_not_served_from_the_cache(self):
+        theme = gd.Theme(os.path.join(_TMP, "cache3.json"))
+        before = self.render(theme, True)
+        self.gauges[0] = dict(self.gauges[0], red=60)
+        after = self.render(theme, True)
+        self.assertGreater(self.difference(before, after)[0], 0.3)
+        theme.set_label("cpu_temp", "ENGINE")
+        placed, _bh = gd.deck_layout(self.gauges)
+        self.assertLess(self.difference(self.render(theme, True), self.render(theme, False))[0], 6)
+
+    def test_the_alarm_flash_state_has_its_own_picture(self):
+        theme = gd.Theme(os.path.join(_TMP, "cache4.json"))
+        calm, flash = self.render(theme, True, hot=False), self.render(theme, True, hot=True)
+        self.assertGreater(self.difference(calm, flash)[0], 0.3)
+
+    def test_a_replaced_picture_file_is_picked_up(self):
+        import cairo
+        pic = os.path.join(_TMP, "layer-pic.png")
+
+        def make(rgb):
+            surf = cairo.ImageSurface(cairo.FORMAT_RGB24, 30, 30)
+            c = cairo.Context(surf)
+            c.set_source_rgb(*rgb)
+            c.paint()
+            surf.write_to_png(pic)
+        theme = gd.Theme(os.path.join(_TMP, "cache5.json"))
+        theme.set(None, "style", "image", pic)
+        theme.set(None, "style", "image_dim", 0.0)
+        make((1, 0, 0))
+        red = self.render(theme, True)
+        make((0, 0, 1))
+        os.utime(pic, (os.stat(pic).st_atime, os.stat(pic).st_mtime + 5))
+        blue = self.render(theme, True)
+        self.assertGreater(self.difference(red, blue)[0], 5)
+
+    def test_the_cache_does_not_grow_without_limit(self):
+        import cairo
+        theme = gd.Theme(os.path.join(_TMP, "cache6.json"))
+        placed, bh = gd.deck_layout(self.gauges)
+        for width in range(200, 600, 5):                 # dragging a window to many sizes
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, int(bh * width / gd.BASE_W) + 1)
+            gd.draw_deck(cairo.Context(surf), width, int(bh * width / gd.BASE_W) + 1, placed, bh, self.vals,
+                         {}, theme, set(), False, "T", {}, 1)
+        self.assertLessEqual(len(gd._LAYERS), 81)
 
 
 class AlertTests(unittest.TestCase):

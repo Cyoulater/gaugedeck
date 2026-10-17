@@ -23,6 +23,8 @@ and choose "Pin to Dash" to keep it there. Close it with the X.
   on the icon (on Ubuntu's dock).
 - **Menu button (top right)**: Customize look, Choose sensors, open the compact strip, bring all
   gauges back, pin GaugeDeck to the dock.
+- **Gauges you pop out from the deck close when the deck closes**, and come back the next time the deck
+  opens. Gauges you start from their own pinned icon, and the strip, keep running on their own.
 - **Gauges in their own windows** can hide their title bar (drag them anywhere), be made bigger or
   smaller, and remember that on the next start. "Keep in front..." explains how to make a window
   stay on top.
@@ -67,6 +69,12 @@ See everything that was found, with its reading and where it comes from:
 
     gaugedeck --sensors
 
+Motherboard chips often list sensors with nothing attached: a temperature that reads 0 or a steady
+114-117 degrees, a PECI or PCH reading that is not a temperature, voltages stuck at 0 V, fans at 0 RPM.
+GaugeDeck marks these as **Looks unconnected** (a group at the bottom of the Sensors window), keeps them
+off, and never raises an alert for them. Fans that have never spun never raise a "fan stopped" alert,
+and a reading that jumps to a glitch value (0, -128, 255) is ignored.
+
 If a sensor you expect is missing, send that list in a bug report.
 For board sensors, run `sudo sensors-detect` once (package `lm-sensors`).
 
@@ -74,8 +82,11 @@ For board sensors, run `sudo sensors-detect` once (package `lm-sensors`).
 Edit `~/.config/gaugedeck/config` (the title and window size can also be changed in Customize):
 
     title=MY RIG
-    scale=0.6      # 0.3 = tiny, 1.0 = large
-    dock_badge=on  # show a live number on the dock icon
+    scale=0.6          # 0.3 = tiny, 1.0 = large
+    update_seconds=1   # how often to read the sensors (0.5 to 10); higher uses less CPU
+    dock_badge=on      # show a live number on the dock icon
+
+Settings files from earlier versions keep working. Notes after a `#` on a number or on/off line are fine.
 
 ## Alerts
 GaugeDeck warns you when something is wrong: a desktop notification, an alarm
@@ -113,13 +124,28 @@ Sensors are only read (from /sys, /proc and `nvidia-smi`). GaugeDeck writes only
   `~/.local/share/icons`, and an entry in the dock's favorites (the same as right-click, Add to Favorites)
 
 ## Requirements
-GTK 4.10 or newer (Ubuntu 24.04 and later), Python 3 with `python3-gi` and `python3-gi-cairo`.
+GTK 4 with Python 3 and `python3-gi`, `python3-gi-cairo` and `gir1.2-gtk-4.0` (`sh install.sh` installs them
+with apt). Plain GTK 4, no libadwaita. GTK 4.10 or newer uses its newer color, picture and message dialogs;
+older GTK 4 (such as 4.8 on Debian 12 and MX Linux 23) uses the older ones, which GaugeDeck switches to by itself.
+
+Desktops: GNOME on Wayland or X11, and Xfce or other X11 desktops. The dock number badge and the
+"Pin to dock" button are for Ubuntu's dock and GNOME. Elsewhere they quietly do nothing, and pinning puts
+a launcher in your app menu to add to your panel or favorites yourself.
+
+## How much CPU it uses
+Reading sensors takes almost nothing. Drawing is the cost, so the parts of each gauge that never change
+(face, rim, glow, ticks, numbers) are drawn once and reused, and a frame is skipped when nothing visible
+changed. With 13 gauges on a machine with no graphics acceleration at all, the plain look uses about 0.3% of
+one core and the glowing looks 1 to 2.5%. Raise `update_seconds` to lower that further. NVIDIA cards are asked
+through `nvidia-smi` at most every 3 seconds.
 
 ## Tests
     python3 -m unittest discover -s tests -v
 
 ## Uninstall
     sh uninstall.sh
+Removes the program, the app-menu entry, every launcher and icon made by pinning a gauge or the strip
+(and takes them off the dock), and `~/.config/gaugedeck`. Your own pictures are never touched.
 
 ## License
 GPL-3.0-or-later. Free to use, share, and modify. If you share a changed
