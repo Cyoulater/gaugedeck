@@ -98,14 +98,66 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(other.look(None).s["face"], "hexagon")
         self.theme.set(None, "style", "face", "octagon")
         self.theme.save()
+        seen = []
+        other.connect(seen.append)
         self.assertTrue(other.reload())
+        self.assertEqual(seen, [True])           # listeners are told it came from outside
         self.assertEqual(other.look(None).s["face"], "octagon")
         self.assertFalse(other.reload())      # nothing new
+
+    def test_new_style_keys_are_checked(self):
+        st = gd.clean_style({"display": "graph", "glow": 5, "image": " ~/p.png ", "image_dim": -1,
+                             "bg_image": 7, "bg_dim": 0.3})
+        self.assertEqual(st, {"display": "graph", "glow": 1.0, "image": "~/p.png", "image_dim": 0.0, "bg_dim": 0.3})
+        self.assertEqual(gd.clean_style({"display": "hologram"}), {})
 
     def test_every_preset_is_valid(self):
         for name, p in gd.PRESETS.items():
             self.assertEqual(gd.clean_colors(p["colors"]), p["colors"], name)
             self.assertEqual(gd.clean_style(p["style"]), p["style"], name)
+
+
+class DrawingTests(unittest.TestCase):
+    """Every look draws every gauge style without errors, with and without data."""
+
+    def test_all_presets_and_displays_draw(self):
+        import cairo
+        theme = gd.Theme(os.path.join(_TMP, "draw.json"))
+        gauge = gd.GAUGES[0]
+        for preset in gd.PRESETS:
+            theme.apply_preset(None, preset)
+            for display in gd.STYLE_CHOICES["display"]:
+                for face in gd.STYLE_CHOICES["face"]:
+                    theme.set(None, "style", "display", display)
+                    theme.set(None, "style", "face", face)
+                    for v, hist in ((None, None), (50, []), (120, [10, 50, 90])):
+                        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 120, 120)
+                        gd.draw_gauge(cairo.Context(surf), 60, 60, 50, gauge, v, theme.look(None),
+                                      None, True, True, hist)
+
+    def test_a_missing_or_broken_picture_is_ignored(self):
+        self.assertIsNone(gd.PICTURES.get(""))
+        self.assertIsNone(gd.PICTURES.get("/no/such/picture.png"))
+        bad = os.path.join(_TMP, "bad.png")
+        with open(bad, "w") as f:
+            f.write("not a picture")
+        self.assertIsNone(gd.PICTURES.get(bad))
+
+    def test_a_picture_draws_inside_a_dial(self):
+        import cairo
+        pic = os.path.join(_TMP, "pic.png")
+        s = cairo.ImageSurface(cairo.FORMAT_RGB24, 40, 20)
+        c = cairo.Context(s)
+        c.set_source_rgb(1, 0, 0)
+        c.paint()
+        s.write_to_png(pic)
+        theme = gd.Theme(os.path.join(_TMP, "pic.json"))
+        theme.set(None, "style", "image", pic)
+        theme.set(None, "style", "image_dim", 0.0)
+        out = cairo.ImageSurface(cairo.FORMAT_ARGB32, 100, 100)
+        gd.draw_gauge(cairo.Context(out), 50, 50, 45, gd.GAUGES[0], None, theme.look(None))
+        r, g, b = out.get_data()[(10 * 100 + 50) * 4 + 2], out.get_data()[(10 * 100 + 50) * 4 + 1], 0
+        self.assertGreater(r, 150)                # red picture shows near the top of the face
 
 
 class AlertTests(unittest.TestCase):

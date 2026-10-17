@@ -32,8 +32,10 @@ import sys
 import threading
 import time
 import zlib
+from collections import deque
 from xml.sax.saxutils import escape as xml_escape
 
+import cairo
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
@@ -412,11 +414,14 @@ STYLE_OPTIONS = {
     "hub":    [("dot", "Dot"), ("ring", "Ring"), ("none", "None")],
     "sweep":  [(180, "Half circle"), (220, "Short"), (270, "Car"), (300, "Wide")],
     "font":   [("sans", "Sans"), ("serif", "Serif"), ("mono", "Monospace")],
+    "display": [("dial", "Dial"), ("ring", "Ring"), ("bar", "Bar"),
+                ("digital", "Digital"), ("graph", "Graph")],
 }
 STYLE_CHOICES = {k: [v for v, _ in opts] for k, opts in STYLE_OPTIONS.items()}
 DEFAULT_STYLE = {"face": "circle", "needle": "line", "ticks": "bars", "hub": "dot",
                  "sweep": 270, "font": "sans", "rim_width": 0.06,
-                 "numbers": True, "red_zone": True}
+                 "numbers": True, "red_zone": True, "display": "dial", "glow": 0.0,
+                 "image": "", "image_dim": 0.5, "bg_image": "", "bg_dim": 0.55}
 FONTS = {"sans": "DejaVu Sans", "serif": "DejaVu Serif", "mono": "DejaVu Sans Mono"}
 TITLE_FONTS = {"sans": "DejaVu Sans Condensed", "serif": "DejaVu Serif", "mono": "DejaVu Sans Mono"}
 
@@ -425,15 +430,15 @@ PRESETS = {
     "Neon": {
         "colors": {"bg": "#05060f", "face": "#0a0d1f", "rim": "#00e5ff", "tick": "#7df9ff",
                    "needle": "#ff2bd6", "red": "#ff2bd6", "text": "#e8ffff", "dim": "#5fb4c4"},
-        "style": {"face": "hexagon", "needle": "blade", "ticks": "dots", "hub": "ring"}},
+        "style": {"face": "hexagon", "needle": "blade", "ticks": "dots", "hub": "ring", "glow": 0.9}},
     "Ice": {
         "colors": {"bg": "#0b1320", "face": "#111d30", "rim": "#6fa8dc", "tick": "#cfe3f7",
                    "needle": "#ffd166", "red": "#ef476f", "text": "#f1f7ff", "dim": "#7f98b5"},
-        "style": {"face": "rounded", "needle": "arrow", "hub": "ring"}},
+        "style": {"face": "rounded", "needle": "arrow", "hub": "ring", "glow": 0.35}},
     "Amber": {
         "colors": {"bg": "#120c05", "face": "#1d140a", "rim": "#b8860b", "tick": "#f2c46d",
                    "needle": "#ff8c1a", "red": "#d62d20", "text": "#ffe3b0", "dim": "#a8844a"},
-        "style": {"font": "serif", "sweep": 270}},
+        "style": {"font": "serif", "sweep": 270, "glow": 0.5}},
     "Paper": {
         "colors": {"bg": "#e7e5df", "face": "#fbfaf7", "rim": "#55555a", "tick": "#222222",
                    "needle": "#c8102e", "red": "#c8102e", "text": "#111111", "dim": "#666666"},
@@ -441,7 +446,23 @@ PRESETS = {
     "Terminal": {
         "colors": {"bg": "#000000", "face": "#031003", "rim": "#1aff5c", "tick": "#1aff5c",
                    "needle": "#b6ff00", "red": "#ff3b30", "text": "#b6ffcb", "dim": "#2ea35a"},
-        "style": {"font": "mono", "face": "octagon", "ticks": "dots", "sweep": 220}},
+        "style": {"font": "mono", "face": "octagon", "ticks": "dots", "sweep": 220, "glow": 0.8}},
+    "Dashboard": {
+        "colors": {"bg": "#07090d", "face": "#0e131b", "rim": "#2a7fff", "tick": "#c9d6e8",
+                   "needle": "#38d9ff", "red": "#ff4d5e", "text": "#f4f8ff", "dim": "#7f93ad"},
+        "style": {"display": "digital", "face": "rounded", "glow": 0.6, "rim_width": 0.04}},
+    "Ring Lights": {
+        "colors": {"bg": "#05050a", "face": "#0b0b14", "rim": "#7c3aed", "tick": "#d8c7ff",
+                   "needle": "#22d3ee", "red": "#fb2c75", "text": "#f5f3ff", "dim": "#8b82b8"},
+        "style": {"display": "ring", "face": "circle", "glow": 1.0, "rim_width": 0.035}},
+    "Bar Stack": {
+        "colors": {"bg": "#0b0f0c", "face": "#111812", "rim": "#3f6b4a", "tick": "#cfe8d4",
+                   "needle": "#7dff9a", "red": "#ff5a3c", "text": "#eaffee", "dim": "#7ea388"},
+        "style": {"display": "bar", "face": "rounded", "glow": 0.5, "font": "mono", "rim_width": 0.04}},
+    "Graph Wall": {
+        "colors": {"bg": "#0a0b10", "face": "#10121a", "rim": "#464b66", "tick": "#cfd3e8",
+                   "needle": "#ffb454", "red": "#ff4d5e", "text": "#f3f4fb", "dim": "#8b90ad"},
+        "style": {"display": "graph", "face": "rounded", "glow": 0.4, "rim_width": 0.035}},
 }
 
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -477,7 +498,7 @@ def clean_style(d):
     if not isinstance(d, dict):
         return out
     for k, v in d.items():
-        if k in ("face", "needle", "ticks", "hub", "font"):
+        if k in ("face", "needle", "ticks", "hub", "font", "display"):
             if isinstance(v, str) and v in STYLE_CHOICES[k]:
                 out[k] = v
         elif k == "sweep":
@@ -489,6 +510,15 @@ def clean_style(d):
         elif k in ("numbers", "red_zone"):
             if isinstance(v, bool):
                 out[k] = v
+        elif k == "glow":
+            if _is_num(v):
+                out[k] = max(0.0, min(1.0, float(v)))
+        elif k in ("image_dim", "bg_dim"):
+            if _is_num(v):
+                out[k] = max(0.0, min(0.95, float(v)))
+        elif k in ("image", "bg_image"):
+            if isinstance(v, str) and len(v) <= 1024:
+                out[k] = v.strip()
     return out
 
 
@@ -565,7 +595,7 @@ class Theme:
             return False
         self.data = new
         self._cache = {}
-        self._notify()
+        self._notify(external=True)
         return True
 
     def reload_soon(self):
@@ -595,9 +625,10 @@ class Theme:
             self._save_source = GLib.timeout_add(300, self.save)
         self._notify()
 
-    def _notify(self):
+    def _notify(self, external=False):
+        """Tell the windows the look changed. external: another GaugeDeck window changed it."""
         for cb in list(self.listeners):
-            cb()
+            cb(external)
 
     def connect(self, cb):
         self.listeners.append(cb)
@@ -730,11 +761,119 @@ def save_win_state(name, **kw):
     save_state(s)
 
 
+# ---------------------------------------------------------------- pictures
+try:
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+except (ValueError, ImportError):
+    GdkPixbuf = None
+
+
+class Pictures:
+    """Loads the pictures people choose (shrunk once if huge) and remembers them."""
+    MAX = 1400
+
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, path):
+        if not path or GdkPixbuf is None:
+            return None
+        path = os.path.expanduser(path)
+        try:
+            stamp = os.stat(path).st_mtime
+        except OSError:
+            return None
+        hit = self.cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(path)
+            big = max(pb.get_width(), pb.get_height())
+            if big > self.MAX:
+                k = self.MAX / float(big)
+                pb = pb.scale_simple(max(1, int(pb.get_width() * k)), max(1, int(pb.get_height() * k)),
+                                     GdkPixbuf.InterpType.BILINEAR)
+        except GLib.Error:
+            pb = None
+        self.cache[path] = (stamp, pb)
+        return pb
+
+
+PICTURES = Pictures()
+
+
+def _draw_picture(cr, pb, cx, cy, w, h):
+    """Fill the w x h box centered on (cx, cy) with the picture, cropping the edges."""
+    pw, ph = pb.get_width(), pb.get_height()
+    k = max(w / pw, h / ph)
+    cr.save()
+    cr.translate(cx - pw * k / 2.0, cy - ph * k / 2.0)
+    cr.scale(k, k)
+    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+    cr.paint()
+    cr.restore()
+
+
+def _draw_background(cr, w, h, look):
+    c, st = look.c, look.s
+    cr.set_source_rgb(*c["bg"])
+    cr.paint()
+    pb = PICTURES.get(st["bg_image"])
+    if pb:
+        _draw_picture(cr, pb, w / 2.0, h / 2.0, w, h)
+        cr.set_source_rgba(*c["bg"], st["bg_dim"])
+        cr.paint()
+
+
 # ---------------------------------------------------------------- drawing
 def _centered(cr, text, x, y):
     ext = cr.text_extents(text)
     cr.move_to(x - ext.width / 2 - ext.x_bearing, y - ext.height / 2 - ext.y_bearing)
     cr.show_text(text)
+
+
+def _glow_text(cr, text, x, y, size, color, glow, anchor="center"):
+    """Text that lights up: a soft halo behind crisp letters."""
+    cr.set_font_size(size)
+    ext = cr.text_extents(text)
+    py = y - ext.height / 2 - ext.y_bearing
+    px = {"center": x - ext.width / 2 - ext.x_bearing, "left": x - ext.x_bearing,
+          "right": x - ext.width - ext.x_bearing}[anchor]
+    if glow > 0:
+        cr.new_path()
+        cr.move_to(px, py)
+        cr.text_path(text)
+        path = cr.copy_path()
+        cr.set_line_join(1)
+        for mult, a in ((0.34, 0.10), (0.20, 0.18), (0.10, 0.30)):
+            cr.new_path()
+            cr.append_path(path)
+            cr.set_line_width(size * mult)
+            cr.set_source_rgba(*color, min(0.8, a * glow * 1.6))
+            cr.stroke()
+        cr.new_path()
+    cr.set_source_rgb(*color)
+    cr.move_to(px, py)
+    cr.show_text(text)
+
+
+def _halo(cr, color, width, glow, path=None):
+    """Draw a soft glow around the current path (or the given one). The path is left as it was."""
+    if glow <= 0:
+        return
+    if path is None:
+        path = cr.copy_path()
+    cr.set_line_cap(1)
+    cr.set_line_join(1)
+    for mult, a in ((5.0, 0.07), (3.2, 0.12), (1.9, 0.22)):
+        cr.new_path()
+        cr.append_path(path)
+        cr.set_line_width(width * mult)
+        cr.set_source_rgba(*color, min(0.8, a * glow * 1.6))
+        cr.stroke()
+    cr.new_path()
+    cr.append_path(path)
 
 
 def _face_path(cr, x, y, r, shape):
@@ -765,9 +904,66 @@ def _polygon(cr, pts):
     cr.close_path()
 
 
-def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False):
+def _round_rect(cr, x, y, w, h, rad):
+    rad = min(rad, w / 2.0, h / 2.0)
+    cr.new_sub_path()
+    cr.arc(x + w - rad, y + rad, rad, -math.pi / 2, 0)
+    cr.arc(x + w - rad, y + h - rad, rad, 0, math.pi / 2)
+    cr.arc(x + rad, y + h - rad, rad, math.pi / 2, math.pi)
+    cr.arc(x + rad, y + rad, rad, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+
+def _frame(cr, x, y, r, look, alarm, hot):
+    """The face of a gauge: color, optional picture, backlight and a glowing rim."""
     c, st = look.c, look.s
-    vmin, vmax, red, unit, scale = g["min"], g["max"], g["red"], g["unit"], g["scale"]
+    gl = st["glow"]
+    _face_path(cr, x, y, r, st["face"])
+    cr.set_source_rgb(*(_mix(c["face"], c["red"], 0.3) if hot else c["face"]))
+    cr.fill_preserve()
+    outline = cr.copy_path()
+    cr.save()
+    cr.clip()
+    pb = PICTURES.get(st["image"])
+    if pb:
+        _draw_picture(cr, pb, x, y, 2 * r, 2 * r)
+        cr.set_source_rgba(*c["face"], st["image_dim"])
+        cr.paint()
+    if gl > 0:                                  # backlight: the face brightens toward the rim
+        grad = _radial(cr, x, y, r * 0.35, r * 1.05)
+        grad.add_color_stop_rgba(0, *c["rim"], 0.0)
+        grad.add_color_stop_rgba(1, *c["rim"], 0.38 * gl)
+        cr.set_source(grad)
+        cr.paint()
+    cr.restore()
+    cr.new_path()
+    cr.append_path(outline)
+    width = r * st["rim_width"] * (1.5 if alarm else 1.0)
+    rim = c["red"] if hot else c["rim"]
+    _halo(cr, rim, width, gl, outline)
+    cr.set_line_width(width)
+    cr.set_source_rgb(*rim)
+    cr.stroke()
+
+
+def _radial(cr, x, y, r0, r1):
+    return cairo.RadialGradient(x, y, r0, x, y, r1)
+
+
+def _fit_text(cr, text, size, max_width):
+    cr.set_font_size(size)
+    w = cr.text_extents(text).x_advance
+    return size * max_width / w if w > max_width else size
+
+
+def _value_text(g, v):
+    return f"{int(round(v))} {g['unit']}" if v is not None else "--"
+
+
+def _dial(cr, x, y, r, g, v, look, label, hist):
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red, scale = g["min"], g["max"], g["red"], g["scale"]
     sweep = st["sweep"]
     a0 = 90 + (360 - sweep) / 2.0
 
@@ -775,17 +971,11 @@ def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False):
         t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
         return math.radians(a0 + sweep * t)
 
-    hot = alarm and blink
-    _face_path(cr, x, y, r, st["face"])
-    cr.set_source_rgb(*(_mix(c["face"], c["red"], 0.3) if hot else c["face"]))
-    cr.fill_preserve()
-    cr.set_line_width(r * st["rim_width"] * (1.5 if alarm else 1.0))
-    cr.set_source_rgb(*(c["red"] if hot else c["rim"]))
-    cr.stroke()
-
     if st["red_zone"] and red < vmax:
-        cr.set_line_width(r * 0.09)
+        cr.new_path()
         cr.arc(x, y, r * 0.84, ang(red), ang(vmax))
+        _halo(cr, c["red"], r * 0.09, gl)
+        cr.set_line_width(r * 0.09)
         cr.set_source_rgb(*c["red"])
         cr.stroke()
 
@@ -794,40 +984,38 @@ def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False):
         val = vmin + (vmax - vmin) * i / 50
         a = ang(val)
         major = i % 5 == 0
-        in_red = st["red_zone"] and val >= red
+        col = c["red"] if st["red_zone"] and val >= red else c["tick"]
         if st["ticks"] == "bars":
             r1, r2 = r * (0.72 if major else 0.78), r * 0.88
-            cr.set_line_width(r * (0.025 if major else 0.012))
-            cr.set_source_rgb(*(c["red"] if in_red else c["tick"]))
+            cr.new_path()
             cr.move_to(x + r1 * math.cos(a), y + r1 * math.sin(a))
             cr.line_to(x + r2 * math.cos(a), y + r2 * math.sin(a))
+            if major:
+                _halo(cr, col, r * 0.025, gl)
+            cr.set_line_width(r * (0.025 if major else 0.012))
+            cr.set_source_rgb(*col)
             cr.stroke()
         elif st["ticks"] == "dots":
             rd = r * (0.80 if major else 0.84)
-            cr.set_source_rgb(*(c["red"] if in_red else c["tick"]))
-            cr.arc(x + rd * math.cos(a), y + rd * math.sin(a), r * (0.028 if major else 0.014), 0, 2 * math.pi)
+            dx, dy, dr = x + rd * math.cos(a), y + rd * math.sin(a), r * (0.028 if major else 0.014)
+            if gl > 0 and major:
+                cr.set_source_rgba(*col, min(0.6, 0.3 * gl))
+                cr.arc(dx, dy, dr * 2.6, 0, 2 * math.pi)
+                cr.fill()
+            cr.set_source_rgb(*col)
+            cr.arc(dx, dy, dr, 0, 2 * math.pi)
             cr.fill()
         if st["numbers"] and major and i % 10 == 0 and 0 < i < 50:
             num = val / (scale or 1)
             s = f"{num:.1f}" if scale and num != int(num) else f"{int(round(num))}"
-            cr.set_font_size(r * 0.13)
-            cr.set_source_rgb(*c["dim"])
             rt = r * 0.58
-            _centered(cr, s, x + rt * math.cos(a), y + rt * math.sin(a))
+            _glow_text(cr, s, x + rt * math.cos(a), y + rt * math.sin(a), r * 0.13, c["dim"], gl * 0.6)
 
-    cr.set_font_size(r * 0.12)
-    cr.set_source_rgb(*c["dim"])
-    _centered(cr, label or g["label"], x, y + r * 0.30)
-
-    txt = f"{int(round(v))} {unit}" if v is not None else "--"
-    size = r * 0.2
-    cr.set_font_size(size)
-    width = cr.text_extents(txt).x_advance
-    if width > r * 1.4:                       # keep long readings such as "2100 RPM" inside the dial
-        size *= r * 1.4 / width
-        cr.set_font_size(size)
-    cr.set_source_rgb(*(c["red"] if v is not None and st["red_zone"] and v >= red else c["text"]))
-    _centered(cr, txt, x, y + r * 0.60)
+    _glow_text(cr, label, x, y + r * 0.30, r * 0.12, c["dim"], gl * 0.5)
+    txt = _value_text(g, v)
+    size = _fit_text(cr, txt, r * 0.2, r * 1.4)         # keep long readings such as "2100 RPM" inside
+    _glow_text(cr, txt, x, y + r * 0.60, size,
+               c["red"] if v is not None and st["red_zone"] and v >= red else c["text"], gl)
 
     if v is not None:
         a = ang(v)
@@ -835,26 +1023,38 @@ def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False):
         px, py = -sa, ca                      # sideways from the needle
         cr.set_source_rgb(*c["needle"])
         if st["needle"] == "line":
-            cr.set_line_cap(1)
-            cr.set_line_width(r * 0.045)
+            cr.new_path()
             cr.move_to(x - r * 0.12 * ca, y - r * 0.12 * sa)
             cr.line_to(x + r * 0.8 * ca, y + r * 0.8 * sa)
+            _halo(cr, c["needle"], r * 0.045, gl)
+            cr.set_line_cap(1)
+            cr.set_line_width(r * 0.045)
+            cr.set_source_rgb(*c["needle"])
             cr.stroke()
             cr.set_line_cap(0)
         elif st["needle"] == "arrow":
-            cr.set_line_width(r * 0.03)
+            cr.new_path()
             cr.move_to(x - r * 0.12 * ca, y - r * 0.12 * sa)
             cr.line_to(x + r * 0.62 * ca, y + r * 0.62 * sa)
+            _halo(cr, c["needle"], r * 0.03, gl)
+            cr.set_line_width(r * 0.03)
+            cr.set_source_rgb(*c["needle"])
             cr.stroke()
+            cr.new_path()
             _polygon(cr, [(x + r * 0.58 * ca + r * 0.07 * px, y + r * 0.58 * sa + r * 0.07 * py),
                           (x + r * 0.84 * ca, y + r * 0.84 * sa),
                           (x + r * 0.58 * ca - r * 0.07 * px, y + r * 0.58 * sa - r * 0.07 * py)])
+            _halo(cr, c["needle"], r * 0.03, gl)
+            cr.set_source_rgb(*c["needle"])
             cr.fill()
         else:
+            cr.new_path()
             _polygon(cr, [(x - r * 0.14 * ca, y - r * 0.14 * sa),
                           (x + r * 0.05 * px, y + r * 0.05 * py),
                           (x + r * 0.80 * ca, y + r * 0.80 * sa),
                           (x - r * 0.05 * px, y - r * 0.05 * py)])
+            _halo(cr, c["needle"], r * 0.03, gl)
+            cr.set_source_rgb(*c["needle"])
             cr.fill()
 
     if st["hub"] == "dot":
@@ -868,6 +1068,194 @@ def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False):
         cr.set_line_width(r * 0.03)
         cr.set_source_rgb(*c["rim"])
         cr.stroke()
+
+
+def _ring(cr, x, y, r, g, v, look, label, hist):
+    """A thick ring that fills up, with the reading in the middle."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    sweep = st["sweep"]
+    a0 = 90 + (360 - sweep) / 2.0
+
+    def ang(val):
+        t = max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+        return math.radians(a0 + sweep * t)
+
+    rad, lw = r * 0.70, r * 0.17
+    cr.set_line_cap(1)
+    cr.new_path()
+    cr.arc(x, y, rad, ang(vmin), ang(vmax))
+    cr.set_line_width(lw)
+    cr.set_source_rgb(*_mix(c["face"], c["rim"], 0.28))
+    cr.stroke()
+    if st["red_zone"] and red < vmax:
+        cr.new_path()
+        cr.arc(x, y, rad + lw * 0.78, ang(red), ang(vmax))
+        cr.set_line_width(lw * 0.22)
+        cr.set_source_rgb(*c["red"])
+        cr.stroke()
+    over = v is not None and st["red_zone"] and v >= red
+    if v is not None and v > vmin:
+        col = c["red"] if over else c["needle"]
+        cr.new_path()
+        cr.arc(x, y, rad, ang(vmin), ang(v))
+        _halo(cr, col, lw, gl)
+        cr.set_line_width(lw)
+        cr.set_source_rgb(*col)
+        cr.stroke()
+    cr.set_line_cap(0)
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    num = f"{int(round(v))}" if v is not None else "--"
+    _glow_text(cr, num, x, y - r * 0.08, _fit_text(cr, num, r * 0.46, r * 1.0),
+               c["red"] if over else c["text"], gl)
+    _glow_text(cr, g["unit"], x, y + r * 0.22, r * 0.13, c["dim"], gl * 0.5)
+    _glow_text(cr, label, x, y + r * 0.44, _fit_text(cr, label, r * 0.12, r * 1.2), c["dim"], gl * 0.5)
+
+
+def _bar(cr, x, y, r, g, v, look, label, hist):
+    """A horizontal level meter."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    _glow_text(cr, label, x, y - r * 0.58, _fit_text(cr, label, r * 0.14, r * 1.4), c["dim"], gl * 0.5)
+    txt = _value_text(g, v)
+    over = v is not None and st["red_zone"] and v >= red
+    _glow_text(cr, txt, x, y - r * 0.18, _fit_text(cr, txt, r * 0.3, r * 1.45),
+               c["red"] if over else c["text"], gl)
+    bx, bw, by, bh = x - r * 0.75, r * 1.5, y + r * 0.22, r * 0.22
+    _round_rect(cr, bx, by, bw, bh, bh / 2)
+    cr.set_source_rgb(*_mix(c["face"], c["rim"], 0.25))
+    cr.fill()
+    if st["red_zone"] and red < vmax:
+        t = (red - vmin) / (vmax - vmin)
+        cr.save()
+        _round_rect(cr, bx, by, bw, bh, bh / 2)
+        cr.clip()
+        cr.rectangle(bx + bw * t, by, bw * (1 - t), bh)
+        cr.set_source_rgba(*c["red"], 0.45)
+        cr.fill()
+        cr.restore()
+    if v is not None:
+        t = max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
+        if t > 0:
+            col = c["red"] if over else c["needle"]
+            _round_rect(cr, bx, by, max(bw * t, bh), bh, bh / 2)
+            _halo_fill(cr, col, bh * 0.6, gl)
+            cr.set_source_rgb(*col)
+            cr.fill()
+    _glow_text(cr, f"{vmin:g}", bx, y + r * 0.66, r * 0.1, c["dim"], 0, "left")
+    _glow_text(cr, f"{vmax:g}", bx + bw, y + r * 0.66, r * 0.1, c["dim"], 0, "right")
+
+
+def _halo_fill(cr, color, width, glow):
+    """Glow around a filled shape (the shape stays as the current path)."""
+    if glow > 0:
+        _halo(cr, color, width, glow)
+
+
+def _digital(cr, x, y, r, g, v, look, label, hist):
+    """A big number with a row of segments that light up."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    over = v is not None and st["red_zone"] and v >= red
+    col = c["red"] if over else c["text"]
+    _glow_text(cr, label, x, y - r * 0.62, _fit_text(cr, label, r * 0.14, r * 1.4), c["dim"], gl * 0.5)
+    num = f"{int(round(v))}" if v is not None else "--"
+    big = _fit_text(cr, num, r * 0.62, r * 1.2)
+    unit = g["unit"] if v is not None else ""
+    cr.set_font_size(big)
+    n_w = cr.text_extents(num).x_advance
+    cr.set_font_size(r * 0.15)
+    u_w = cr.text_extents(unit).x_advance + r * 0.06 if unit else 0
+    left = x - (n_w + u_w) / 2.0
+    _glow_text(cr, num, left, y - r * 0.1, big, col, gl, "left")
+    if unit:
+        _glow_text(cr, unit, left + n_w + r * 0.06, y + r * 0.04, r * 0.15, c["dim"], gl * 0.5, "left")
+    n = 12
+    sw, gap = (r * 1.5) / n, r * 0.04
+    lit = 0 if v is None else int(round(max(0.0, min(1.0, (v - vmin) / (vmax - vmin))) * n))
+    for i in range(n):
+        seg_red = st["red_zone"] and (vmin + (vmax - vmin) * (i + 0.5) / n) >= red
+        base = c["red"] if seg_red else c["needle"]
+        sx = x - r * 0.75 + i * sw
+        _round_rect(cr, sx + gap / 2, y + r * 0.34, sw - gap, r * 0.2, r * 0.04)
+        if i < lit:
+            _halo_fill(cr, base, r * 0.1, gl)
+            cr.set_source_rgb(*base)
+        else:
+            cr.set_source_rgb(*_mix(c["face"], base, 0.16))
+        cr.fill()
+
+
+def _graph(cr, x, y, r, g, v, look, label, hist):
+    """A line that shows the last minute and a half."""
+    c, st = look.c, look.s
+    gl = st["glow"]
+    vmin, vmax, red = g["min"], g["max"], g["red"]
+    cr.select_font_face(FONTS[st["font"]], 0, 1)
+    over = v is not None and st["red_zone"] and v >= red
+    txt = _value_text(g, v)
+    value_size = _fit_text(cr, txt, r * 0.2, r * 0.78)
+    cr.set_font_size(value_size)
+    room = r * 1.56 - cr.text_extents(txt).x_advance - r * 0.1        # what is left for the name
+    _glow_text(cr, label, x - r * 0.78, y - r * 0.62, _fit_text(cr, label, r * 0.14, max(room, r * 0.3)),
+               c["dim"], gl * 0.5, "left")
+    _glow_text(cr, txt, x + r * 0.78, y - r * 0.62, value_size, c["red"] if over else c["text"], gl, "right")
+    px0, px1, py0, py1 = x - r * 0.78, x + r * 0.78, y - r * 0.38, y + r * 0.62
+
+    def py(val):
+        return py1 - (py1 - py0) * max(0.0, min(1.0, (val - vmin) / (vmax - vmin)))
+
+    cr.set_source_rgb(*_mix(c["face"], c["rim"], 0.25))
+    cr.set_line_width(r * 0.012)
+    for f in (0.0, 0.5, 1.0):
+        cr.move_to(px0, py1 - (py1 - py0) * f)
+        cr.line_to(px1, py1 - (py1 - py0) * f)
+    cr.stroke()
+    if st["red_zone"] and red < vmax:
+        cr.set_source_rgba(*c["red"], 0.7)
+        cr.set_dash([r * 0.05, r * 0.04])
+        cr.move_to(px0, py(red))
+        cr.line_to(px1, py(red))
+        cr.stroke()
+        cr.set_dash([])
+    pts = list(hist or [])[-90:]
+    if len(pts) < 2:
+        _glow_text(cr, "collecting…", x, y + r * 0.12, r * 0.13, c["dim"], 0)
+        return
+    step = (px1 - px0) / 89.0
+    xs = [px1 - step * (len(pts) - 1 - i) for i in range(len(pts))]
+    col = c["red"] if over else c["needle"]
+    cr.new_path()
+    cr.move_to(xs[0], py1)
+    for xx, val in zip(xs, pts):
+        cr.line_to(xx, py(val))
+    cr.line_to(xs[-1], py1)
+    cr.close_path()
+    cr.set_source_rgba(*col, 0.18)
+    cr.fill()
+    cr.new_path()
+    for i, (xx, val) in enumerate(zip(xs, pts)):
+        cr.move_to(xx, py(val)) if i == 0 else cr.line_to(xx, py(val))
+    _halo(cr, col, r * 0.035, gl)
+    cr.set_line_width(r * 0.035)
+    cr.set_source_rgb(*col)
+    cr.stroke()
+
+
+_DISPLAYS = {"dial": _dial, "ring": _ring, "bar": _bar, "digital": _digital, "graph": _graph}
+
+
+def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False, hist=None):
+    """One gauge inside the square of half-size r around (x, y), in the chosen display style."""
+    hot = alarm and blink
+    _frame(cr, x, y, r, look, alarm, hot)
+    cr.select_font_face(FONTS[look.s["font"]], 0, 1)
+    _DISPLAYS[look.s["display"]](cr, x, y, r, g, v, look, label or g["label"], hist)
 
 
 BASE_W = 540
@@ -903,10 +1291,9 @@ def _fit(w, h, bw, bh):
     return s, (w - bw * s) / 2.0, (h - bh * s) / 2.0
 
 
-def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title):
+def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title, history=None):
     look0 = theme.look(None)
-    cr.set_source_rgb(*look0.c["bg"])
-    cr.paint()
+    _draw_background(cr, w, h, look0)
     s, ox, oy = _fit(w, h, BASE_W, bh)
     cr.translate(ox, oy)
     cr.scale(s, s)
@@ -919,20 +1306,19 @@ def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title)
         key = g["key"]
         on = key in alarms or (key + "_stop") in alarms
         draw_gauge(cr, x, y, r, g, values.get(key), theme.look(key),
-                   theme.label(key) or labels.get(key), on, blink)
+                   theme.label(key) or labels.get(key), on, blink, (history or {}).get(key))
     cr.select_font_face(TITLE_FONTS[look0.s["font"]], 0, 1)
     cr.set_font_size(30)
     cr.set_source_rgb(*look0.c["red"])
     _centered(cr, (theme.title or TITLE).upper(), BASE_W / 2, bh - 35)
 
 
-def draw_solo(cr, w, h, g, v, look, label, alarm, blink):
-    cr.set_source_rgb(*look.c["bg"])
-    cr.paint()
+def draw_solo(cr, w, h, g, v, look, label, alarm, blink, hist=None):
+    _draw_background(cr, w, h, look)
     s = min(w, h) / 230.0
     cr.translate(w / 2.0, h / 2.0)
     cr.scale(s, s)
-    draw_gauge(cr, 0, 0, 100, g, v, look, label, alarm, blink)
+    draw_gauge(cr, 0, 0, 100, g, v, look, label, alarm, blink, hist)
 
 
 STRIP_CELL_W, STRIP_CELL_H = 100, 64
@@ -946,8 +1332,7 @@ def strip_size(n, vertical):
 def draw_strip(cr, w, h, gauges, values, labels, theme, alarms, blink, vertical):
     look = theme.look(None)
     c = look.c
-    cr.set_source_rgb(*c["bg"])
-    cr.paint()
+    _draw_background(cr, w, h, look)
     bw, bh = strip_size(len(gauges), vertical)
     s, ox, oy = _fit(w, h, bw, bh)
     cr.translate(ox, oy)
@@ -1288,6 +1673,7 @@ class BaseWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title=title)
         self.app = app
         self.values = {}
+        self.history = {}                 # the last ~90 readings of each gauge, for the Graph style
         self.blink = False
         self.test_flash = set()
         self.want = frozenset()
@@ -1327,11 +1713,14 @@ class BaseWindow(Gtk.ApplicationWindow):
         if self._closed:
             return
         self.values = vals
+        for key in self.shown_keys():
+            if vals.get(key) is not None:
+                self.history.setdefault(key, deque(maxlen=90)).append(vals[key])
         self.alerts.update(vals, self.alert_keys())
         self._update_badge(vals)
         self.area.queue_draw()
 
-    def _theme_changed(self):
+    def _theme_changed(self, external=False):
         if not self._closed:
             self.area.queue_draw()
 
@@ -1553,7 +1942,7 @@ class DeckWindow(BaseWindow):
     def _draw(self, _area, cr, w, h):
         placed, bh = self._layout_cache
         draw_deck(cr, w, h, placed, bh, self.values, self.app.fan_labels, self.app.theme,
-                  self.alerts.active | self.test_flash, self.blink, TITLE)
+                  self.alerts.active | self.test_flash, self.blink, TITLE, self.history)
 
     def _on_close(self, win):
         for w in self._watches:
@@ -1650,7 +2039,8 @@ class GaugeWindow(OverlayWindow):
     def _draw(self, _area, cr, w, h):
         draw_solo(cr, w, h, self.g, self.values.get(self.key), self.app.theme.look(self.key),
                   self.app.display_label(self.key), self.key in self.alerts.active
-                  or self.key + "_stop" in self.alerts.active or self.key in self.test_flash, self.blink)
+                  or self.key + "_stop" in self.alerts.active or self.key in self.test_flash, self.blink,
+                  self.history.get(self.key))
 
     def context_menu(self, x, y):
         extra = Gio.Menu()
@@ -1852,8 +2242,9 @@ class CustomizeWindow(Gtk.Window):
         grid.attach(self._caption("Shapes"), 0, row, 2, 1)
         row += 1
         self.dds = {}
-        for name, text in (("face", "Dial shape"), ("needle", "Needle"), ("ticks", "Tick marks"),
-                           ("hub", "Center cap"), ("sweep", "Sweep"), ("font", "Lettering")):
+        for name, text in (("display", "Gauge style"), ("face", "Dial shape"), ("needle", "Needle"),
+                           ("ticks", "Tick marks"), ("hub", "Center cap"), ("sweep", "Sweep"),
+                           ("font", "Lettering")):
             dd = Gtk.DropDown.new_from_strings([label for _v, label in STYLE_OPTIONS[name]])
             dd.connect("notify::selected", self._style_dd_changed, name)
             self.dds[name] = dd
@@ -1862,12 +2253,35 @@ class CustomizeWindow(Gtk.Window):
         self.rim.set_size_request(160, -1)
         self.rim.connect("value-changed", self._rim_changed)
         add("Rim thickness", self.rim)
+        self.glow = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
+        self.glow.set_size_request(160, -1)
+        self.glow.connect("value-changed", self._glow_changed)
+        add("Glow", self.glow)
         self.sw_numbers = Gtk.Switch(halign=Gtk.Align.END)
         self.sw_numbers.connect("notify::active", self._switch_changed, "numbers")
         add("Numbers on the dial", self.sw_numbers)
         self.sw_red = Gtk.Switch(halign=Gtk.Align.END)
         self.sw_red.connect("notify::active", self._switch_changed, "red_zone")
         add("Red zone", self.sw_red)
+
+        grid.attach(self._caption("Pictures"), 0, row, 2, 1)
+        row += 1
+        self.pics = {}
+        for img, dim, text in (("image", "image_dim", "Picture inside the dial"),
+                               ("bg_image", "bg_dim", "Background picture")):
+            btn = Gtk.Button(label="Choose picture…")
+            btn.connect("clicked", self._choose_picture, img)
+            clear = Gtk.Button(label="Clear")
+            clear.connect("clicked", self._clear_picture, img)
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            box.append(btn)
+            box.append(clear)
+            add(text, box)
+            dimmer = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 0.95, 0.05)
+            dimmer.set_size_request(160, -1)
+            dimmer.connect("value-changed", self._dim_changed, dim)
+            add("   Darken it so the numbers stay clear", dimmer)
+            self.pics[img] = (btn, dimmer, dim)
 
         app.theme.connect(self._theme_changed)
         self.connect("close-request", self._closing)
@@ -1888,7 +2302,9 @@ class CustomizeWindow(Gtk.Window):
         self.app.customize_win = None
         return False
 
-    def _theme_changed(self):
+    def _theme_changed(self, external=False):
+        if external:
+            self._refresh()          # someone else changed the look: show the new values
         self.preview.queue_draw()
 
     def _refresh(self):
@@ -1902,6 +2318,17 @@ class CustomizeWindow(Gtk.Window):
         for name, dd in self.dds.items():
             dd.set_selected(STYLE_CHOICES[name].index(look.s[name]))
         self.rim.set_value(look.s["rim_width"])
+        self.glow.set_value(look.s["glow"])
+        disp = look.s["display"]
+        for name in ("needle", "ticks", "hub"):
+            self.dds[name].set_sensitive(disp == "dial")
+        self.dds["sweep"].set_sensitive(disp in ("dial", "ring"))
+        self.sw_numbers.set_sensitive(disp == "dial")
+        for img, (btn, dimmer, dim) in self.pics.items():
+            path = look.s[img]
+            btn.set_label(os.path.basename(path) if path else "Choose picture…")
+            btn.set_tooltip_text(path or None)
+            dimmer.set_value(look.s[dim])
         self.sw_numbers.set_active(look.s["numbers"])
         self.sw_red.set_active(look.s["red_zone"])
         self.title_entry.set_text(self.theme.title or TITLE)
@@ -1940,6 +2367,41 @@ class CustomizeWindow(Gtk.Window):
     def _style_dd_changed(self, dd, _p, name):
         if not self._loading:
             self.theme.set(self.scope, "style", name, STYLE_CHOICES[name][dd.get_selected()])
+            if name == "display":
+                self._refresh()
+
+    def _glow_changed(self, scale):
+        if not self._loading:
+            self.theme.set(self.scope, "style", "glow", round(scale.get_value(), 2))
+
+    def _dim_changed(self, scale, dim):
+        if not self._loading:
+            self.theme.set(self.scope, "style", dim, round(scale.get_value(), 2))
+
+    def _choose_picture(self, _btn, img):
+        dlg = Gtk.FileDialog(title="Choose a picture")
+        flt = Gtk.FileFilter()
+        flt.set_name("Pictures")
+        flt.add_mime_type("image/*")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(flt)
+        dlg.set_filters(store)
+        dlg.set_default_filter(flt)
+        dlg.open(self, None, self._picture_chosen, img)
+
+    def _picture_chosen(self, dlg, result, img):
+        try:
+            f = dlg.open_finish(result)
+        except GLib.Error:
+            return                                   # cancelled
+        path = f.get_path() if f else None
+        if path:
+            self.theme.set(self.scope, "style", img, path)
+            self._refresh()
+
+    def _clear_picture(self, _btn, img):
+        self.theme.set(self.scope, "style", img, "")
+        self._refresh()
 
     def _rim_changed(self, scale):
         if not self._loading:
