@@ -4,8 +4,8 @@ https://github.com/Cyoulater/gaugedeck
 
 ![GaugeDeck](screenshot.png)
 
-Car-style dashboard gauges for your Linux PC: CPU temp, CPU load, GPU temp,
-fan speeds, RAM use, and board temp.
+Car-style dashboard gauges for your Linux PC: CPU, graphics and compute
+cards, fans, drives, RAM and board, found and named automatically.
 
 Built as a native GTK 4 / Wayland app, so it works on current GNOME desktops
 (Ubuntu 25.10 / 26.04 and later) where desktop widgets like Conky freeze or
@@ -43,23 +43,53 @@ Change the limits in `~/.config/gaugedeck/config`:
     ram_alert=95
     fan_stop_alert=on
     nv_temp_alert=85
-
-## NVIDIA compute cards
-If the machine has an NVIDIA card (like a Tesla P100) alongside an AMD or Intel
-display card, GaugeDeck adds a bottom row with that card's temperature and
-power draw (read from `nvidia-smi`). The temperature alerts at `nv_temp_alert`.
+    drive_temp_alert=70
 
 ## Sensors
-Detected automatically at startup:
-- CPU: Intel (coretemp) or AMD (k10temp / zenpower)
-- GPU: AMD (amdgpu/radeon), Intel, nouveau, or NVIDIA via nvidia-smi
-- Board temp and fans: Nuvoton, ITE, Fintek, Winbond, ASUS, Gigabyte, Dell, ThinkPad, HP
-  (fan gauges show the first two fan headers that are actually spinning)
+GaugeDeck finds the machine's sensors by itself at startup, on any PC, and
+names each gauge after the real part:
 
-A gauge shows `--` if that sensor isn't available. For board sensors, run
-`sudo sensors-detect` once (package `lm-sensors`).
+- CPU: temperature (Intel coretemp, AMD k10temp / zenpower, ARM thermal zones),
+  load from /proc, and package power where RAPL is readable
+- Graphics cards: AMD, Intel and nouveau through /sys (temperature, hot spot,
+  VRAM, fan, power, load); NVIDIA through `nvidia-smi`, including compute cards
+  like the Tesla P100 (temperature, power, load). A card's gauges carry its
+  model, e.g. `RX 6600 TEMP`, `P100 POWER`.
+- Drives: NVMe and SATA drive temperatures, named by model (`980 PRO TEMP`)
+- Board: temperature and every fan header that is spinning (Nuvoton, ITE,
+  Fintek, Winbond, ASUS, Gigabyte, Dell, ThinkPad, HP...)
+- Others: memory module (DIMM), chipset, Wi-Fi and ACPI temperatures
+- RAM use from /proc
 
-Read-only: the app only reads from /sys and /proc. It changes nothing.
+See everything it found, with a live reading of each:
+
+    gaugedeck --check
+
+The deck shows the main sensors (marked `*`). Add or drop gauges by key in
+`~/.config/gaugedeck/config`:
+
+    show=cpu_tccd1,gpu_junction
+    hide=sda_temp
+
+Any sensor can also be opened in its own window: `gaugedeck --gauge KEY`.
+
+A gauge shows `--` if a reading goes away. For board sensors and case fans,
+run `sudo sensors-detect` once (package `lm-sensors`). Temperatures alert at
+`cpu_temp_alert` (CPU), `gpu_temp_alert` (display card), `nv_temp_alert`
+(NVIDIA cards next to the display card), `board_temp_alert` and
+`drive_temp_alert` (default 70).
+
+Read-only: the app only reads from /sys, /proc and nvidia-smi. It changes nothing.
+
+## Tests
+    python3 -m unittest discover -s tests -v
+
+The tests run on fake machines (a desktop with a Tesla P100, a ThinkPad, a
+two-card server, a bare VM) from `tests/fake_machine.py`. To see what
+GaugeDeck would find on one:
+
+    python3 tests/fake_machine.py desktop /tmp/fake
+    GAUGEDECK_ROOT=/tmp/fake PATH=/tmp/fake/bin:$PATH ./gaugedeck.py --check
 
 ## Uninstall
     sh uninstall.sh
