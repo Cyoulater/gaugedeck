@@ -1,5 +1,7 @@
 # GaugeDeck
 
+**[Download for Linux](#download-and-install)**
+
 https://github.com/Cyoulater/gaugedeck
 
 ![GaugeDeck](screenshot.png)
@@ -11,10 +13,27 @@ Built as a native GTK 4 / Wayland app, so it works on current GNOME desktops
 (Ubuntu 25.10 / 26.04 and later) where desktop widgets like Conky freeze or
 fail to draw.
 
-## Install
-    sh install.sh                # or: sh install.sh "MY RIG NAME"   (sets the title shown under the gauges)
+## Download and install
+**Easiest (any Linux):** open a terminal and paste
+
+    curl -fsSL https://raw.githubusercontent.com/Cyoulater/gaugedeck/main/get.sh | sh
+
+It installs what GaugeDeck needs (asks for your password once) and adds it to
+your app menu.
+
+**Or download a package** and double-click it to install with your software center:
+
+| Your Linux | Download |
+|---|---|
+| Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin | [gaugedeck.deb](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.deb) |
+| Fedora, openSUSE | [gaugedeck.rpm](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.rpm) |
+| Anything else | [gaugedeck.tar.gz](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.tar.gz), unpack it, then run `sh install.sh` |
+
 Then open **GaugeDeck** from your app menu. Right-click it in the dock
 and choose "Pin to Dash" to keep it there. Close it with the X.
+
+To set the title shown under the gauges, add it to the end:
+`... | sh -s -- "MY RIG NAME"` or `sh install.sh "MY RIG NAME"`.
 
 ## Settings
 Edit `~/.config/gaugedeck/config`:
@@ -62,7 +81,11 @@ A gauge shows `--` if that sensor isn't available. For board sensors, run
 Read-only: the app only reads from /sys and /proc. It changes nothing.
 
 ## Uninstall
-    sh uninstall.sh
+If you installed the .deb or .rpm, remove "GaugeDeck" in your software center
+(or `sudo apt remove gaugedeck` / `sudo dnf remove gaugedeck`).
+Otherwise paste
+
+    curl -fsSL https://raw.githubusercontent.com/Cyoulater/gaugedeck/main/uninstall.sh | sh
 
 ## License
 GPL-3.0-or-later. Free to use, share, and modify. If you share a changed
