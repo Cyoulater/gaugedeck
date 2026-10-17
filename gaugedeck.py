@@ -550,6 +550,7 @@ class Sensors:
     def __init__(self, catalog):
         self.catalog = {s["key"]: s for s in catalog}
         self._last_cpu = None
+        self._lock = threading.Lock()     # the deck and the Sensors window may both be reading
 
     def _cpu_load(self, path):
         line = _read(path)
@@ -635,14 +636,15 @@ class Sensors:
     def read_all(self, want=None):
         """Read the wanted sensors (all by default) -> {key: value or None}."""
         keys = list(self.catalog) if want is None else [k for k in want if k in self.catalog]
-        nv = _nvidia_query_all() if any(self.catalog[k]["src"][0] in ("nv", "nv_vram") for k in keys) else {}
-        out = {}
-        for k in keys:
-            try:
-                out[k] = self._one(self.catalog[k]["src"], nv)
-            except Exception:           # one odd sensor must not stop the others
-                out[k] = None
-        return out
+        with self._lock:
+            nv = _nvidia_query_all() if any(self.catalog[k]["src"][0] in ("nv", "nv_vram") for k in keys) else {}
+            out = {}
+            for k in keys:
+                try:
+                    out[k] = self._one(self.catalog[k]["src"], nv)
+                except Exception:           # one odd sensor must not stop the others
+                    out[k] = None
+            return out
 
 
 def demo_catalog():

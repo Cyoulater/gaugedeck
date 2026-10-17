@@ -269,6 +269,24 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertAlmostEqual(v["amdgpu_vram"], 100.0 * 2147483648 / 17163091968)
         self.assertIsNone(sensors.read_all(["cpu_temp"]).get("fan1"))     # only what was asked for
 
+    def test_two_threads_reading_at_once_do_not_trip_over_each_other(self):
+        import threading
+        sensors = gd.Sensors(self.cat)
+        errors = []
+
+        def work():
+            try:
+                for _ in range(50):
+                    sensors.read_all(["cpu_load", "cpu_temp", "ram"])
+            except Exception as e:      # pragma: no cover
+                errors.append(e)
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
     def test_a_computer_with_almost_no_sensors_still_works(self):
         empty = tempfile.mkdtemp()
         cat = gd.discover(empty, nvidia={})
