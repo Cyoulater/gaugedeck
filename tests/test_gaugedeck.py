@@ -666,6 +666,81 @@ class LatitudeTests(unittest.TestCase):
         self.assertFalse([s["name"] for s in self.cat if "fan fan" in s["name"].lower()])
 
 
+
+class FanStopTests(unittest.TestCase):
+    """Laptop and graphics-card fans stop by themselves when cool; that is only a problem when warm."""
+
+    def setUp(self):
+        self.sent = []
+        gd.play_alarm = lambda: None
+        gd.CFG["alerts"] = "on"
+        gd.CFG["fan_stop_temp"] = "65"
+        self.addCleanup(setattr, gd, "REG", gd.REG)
+        self.addCleanup(gd.CFG.__setitem__, "fan_stop_temp", "65")
+
+    def alerts(self, builder, nvidia=None):
+        root = tempfile.mkdtemp()
+        builder(root)
+        gd.REG = gd.Registry(gd.discover(root, nvidia=nvidia or {}), os.path.join(_TMP, "fanstop.json"))
+        alerts = gd.Alerts(lambda k, t, b, u: self.sent.append((t, b)), lambda k: "CPU FAN")
+        alerts.hold = 2
+        return alerts
+
+    def run_fan(self, alerts, key, heat_key, rpm_then, heat, ticks=6):
+        alerts.update({key: rpm_then, heat_key: 50}, {key})
+        for _ in range(ticks):
+            alerts.update({key: 0, heat_key: heat}, {key})
+
+    def test_a_dell_fan_that_stops_on_a_cool_laptop_is_not_an_alarm(self):
+        alerts = self.alerts(fake_sysfs.build_latitude_e6410)
+        self.run_fan(alerts, "fan1", "cpu_temp", 2300, 54)           # mini tank: 54 C, fan off, normal
+        self.assertEqual(self.sent, [])
+
+    def test_the_same_fan_stopping_on_a_hot_machine_is_an_alarm(self):
+        alerts = self.alerts(fake_sysfs.build_latitude_e6410)
+        self.run_fan(alerts, "fan1", "cpu_temp", 2300, 72)
+        self.assertEqual([t for t, _b in self.sent], ["CPU FAN stopped"])
+        self.assertIn("72", self.sent[0][1])
+
+    def test_the_alarm_ends_when_the_machine_cools_down(self):
+        alerts = self.alerts(fake_sysfs.build_latitude_e6410)
+        self.run_fan(alerts, "fan1", "cpu_temp", 2300, 72)
+        for _ in range(3):
+            alerts.update({"fan1": 0, "cpu_temp": 50}, {"fan1"})
+        self.assertEqual(self.sent[-1][0], "Back to normal")
+        self.assertIn("cooled down", self.sent[-1][1])
+        self.assertEqual(alerts.active, set())
+
+    def test_the_foundrys_zero_fan_graphics_card_is_quiet_at_idle(self):
+        alerts = self.alerts(fake_sysfs.build_foundry, foundry_nvidia())
+        self.run_fan(alerts, "gpu_fan", "gpu_temp", 1500, 41)        # RX 580 fan stops when idle
+        self.assertEqual(self.sent, [])
+
+    def test_the_same_card_fan_stopping_under_load_is_an_alarm(self):
+        alerts = self.alerts(fake_sysfs.build_foundry, foundry_nvidia())
+        self.run_fan(alerts, "gpu_fan", "gpu_temp", 1500, 85)
+        self.assertEqual([t for t, _b in self.sent], ["CPU FAN stopped"])
+
+    def test_the_limit_can_be_changed(self):
+        gd.CFG["fan_stop_temp"] = "50"
+        alerts = self.alerts(fake_sysfs.build_latitude_e6410)
+        self.run_fan(alerts, "fan1", "cpu_temp", 2300, 54)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_glitch_temperature_does_not_decide_it(self):
+        alerts = self.alerts(fake_sysfs.build_latitude_e6410)
+        self.run_fan(alerts, "fan1", "cpu_temp", 2300, 255)           # not a real reading: judge by nothing
+        self.assertEqual(len(self.sent), 1)                           # no usable temperature: stay careful
+
+    def test_a_window_that_shows_a_fan_also_reads_the_temperatures(self):
+        self.alerts(fake_sysfs.build_latitude_e6410)
+        self.assertEqual(gd.alert_context_keys({"fan1"}), {"cpu_temp"})
+        self.assertEqual(gd.alert_context_keys({"ram", "cpu_load"}), set())
+
+    def test_the_default_limit_and_old_config_files(self):
+        self.assertEqual(gd.load_config(os.path.join(_TMP, "nope"))["fan_stop_temp"], "65")
+
+
 class OldSettingsTests(unittest.TestCase):
     """Settings files written by older versions keep working."""
 

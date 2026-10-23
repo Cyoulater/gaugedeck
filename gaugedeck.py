@@ -48,7 +48,7 @@ except (ImportError, ValueError):
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 APP_NAME = "GaugeDeck"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_ID = "io.github.cyoulater.GaugeDeck"
 CONFIG_DIR = os.environ.get("GAUGEDECK_CONFIG_DIR") or os.path.expanduser("~/.config/gaugedeck")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
@@ -70,7 +70,7 @@ def load_config(path=None):
            "alerts": "on", "alert_sound": "on", "alert_seconds": "5",
            "cpu_temp_alert": "80", "gpu_temp_alert": "85",
            "board_temp_alert": "60", "ram_alert": "95", "fan_stop_alert": "on",
-           "nv_temp_alert": "85", "dock_badge": "on"}
+           "nv_temp_alert": "85", "dock_badge": "on", "fan_stop_temp": "65"}
     try:
         with open(path or CONFIG_PATH, errors="replace") as f:
             for ln in f:
@@ -2152,6 +2152,7 @@ def strip_cell_at(count, vertical, px, py, w, h):
 
 
 # ---------------------------------------------------------------- alerts
+HEAT_KEYS = ("cpu_temp", "gpu_temp", "nv_temp")     # temperatures that tell how hot the machine is
 HYSTERESIS = {"board_temp": 3}      # how far below the limit a reading must fall to count as normal; 5 otherwise
 
 
@@ -2160,6 +2161,23 @@ def alert_rule(g):
     if g and not g.get("junk") and (g.get("kind") == "temp" or g["key"] == "ram"):
         return g["red"], g.get("alert_name") or g["label"], g["unit"]
     return None
+
+
+def machine_heat(v):
+    """The hottest real-looking temperature in the readings v, or None if there is none."""
+    temps = []
+    for key in HEAT_KEYS:
+        g, val = gauge_by_key(key), v.get(key)
+        if g and not g.get("junk") and val is not None and _plausible(g, val):
+            temps.append(val)
+    return max(temps) if temps else None
+
+
+def alert_context_keys(shown):
+    """Extra sensors a window must read so its alerts can judge: a fan gauge needs the temperatures."""
+    if any((gauge_by_key(k) or {}).get("kind") == "fan" for k in shown):
+        return {k for k in HEAT_KEYS if gauge_by_key(k)}
+    return set()
 
 
 def _plausible(g, v):
@@ -2251,11 +2269,19 @@ class Alerts:
                     self.fan_seen[key] = True
                 if not self.fan_seen.get(key):
                     continue      # never saw it spin: probably fan-stop mode, not a failure
+                # Laptop and graphics-card fans stop by themselves when the machine is cool, so a stopped
+                # fan is only a problem when it is warm. With no temperature to judge by, assume it is.
+                heat, limit = machine_heat(v), _num_cfg("fan_stop_temp", 65)
+                warm = heat is None or heat >= limit
                 label = self.label_for(key)
-                self._check(key + "_stop", val == 0, val > 0,
+                self._check(key + "_stop", val == 0 and warm, val > 0 or not warm,
                             f"{label} stopped",
-                            f"{label} was spinning and is now at 0 RPM. Check the fan.",
-                            f"{label} is spinning again ({val:.0f} RPM).")
+                            f"{label} was spinning and is now at 0 RPM"
+                            + (f" while the machine is at {heat:.0f}°C. Check the fan." if heat is not None
+                               else ". Check the fan."),
+                            f"{label} is spinning again ({val:.0f} RPM)." if val > 0
+                            else f"{label} is stopped, but the machine has cooled down"
+                            + (f" ({heat:.0f}°C)." if heat is not None else "."))
 
 
 # ---------------------------------------------------------------- dock and launchers
@@ -2509,7 +2535,8 @@ class BaseWindow(Gtk.ApplicationWindow):
         self.poller.start()
 
     def refresh_want(self):
-        self.want = frozenset(self.shown_keys() | {self.badge_key})
+        shown = self.shown_keys()
+        self.want = frozenset(shown | {self.badge_key} | alert_context_keys(shown))
 
     # --- live updates
     def _on_values(self, vals):
