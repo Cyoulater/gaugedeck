@@ -43,6 +43,11 @@
     <category>Monitor</category>
   </categories>
   <releases>
+    <release version="1.3.1" date="2026-10-23">
+      <description>
+        <p>A fan that stops no longer raises a false alarm on laptops and graphics cards that switch their fan off when cool. The alarm now needs the machine to be warm (fan_stop_temp, 65 by default).</p>
+      </description>
+    </release>
     <release version="1.3.0" date="2026-10-17">
       <description>
         <p>Customize window: colors, shapes, glow and pictures, with ready-made looks. New gauge styles: ring, bar, digital and graph.</p>

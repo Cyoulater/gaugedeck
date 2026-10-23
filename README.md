@@ -94,7 +94,9 @@ sound, and the gauge flashes red. It alerts once when a reading stays in the
 red for 5 seconds (quick spikes are ignored), and again when it's back to normal.
 Every temperature gauge alerts (CPU, GPU, drives, board...), so does memory use.
 
-It also warns if any fan that was spinning stops (0 RPM).
+It also warns if any fan that was spinning stops (0 RPM), but only when the machine is warm. Laptop and
+graphics-card fans switch themselves off when it is cool, and that is normal, so it stays quiet below
+`fan_stop_temp` (65 degrees by default, judged by the hottest CPU or graphics temperature).
 
 Test it:  `gaugedeck --test-alert` (pop-up, alarm, and the CPU TEMP gauge flashes for 10 seconds)
 
@@ -111,6 +113,7 @@ in `~/.config/gaugedeck/config`, or per sensor with **Scale**:
     board_temp_alert=60
     ram_alert=95
     fan_stop_alert=on
+    fan_stop_temp=65
     nv_temp_alert=85
 
 ## Try it without sensors
