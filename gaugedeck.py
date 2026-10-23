@@ -411,10 +411,19 @@ def discover(root="/", nvidia=None, cpu_model=None):
             if lab and ("Package" in lab or "Tctl" in lab or "Tdie" in lab):
                 f = f"{cpu['path']}/temp{i}_input"
                 break
-        add(_sensor("cpu_temp", "CPU TEMP", "CPU temperature", "temp", "°C", 0, 100,
-                    _num_cfg("cpu_temp_alert", 80), ("file", f, 1000), True, "CPU", big=True,
-                    alert_name="CPU temperature", junk=_temp_suspect(cpu["path"], f.rsplit("/temp", 1)[1].split("_")[0],
-                                                                    _num(f, 1000), "")), [f])
+        n = f.rsplit("/temp", 1)[1].split("_")[0]
+        src, name, value = ("file", f, 1000), "CPU temperature", _num(f, 1000)
+        if value is None or value <= 0:
+            # Some processors (older Intel ones such as the i5 M 540) give no whole-CPU reading, only
+            # one per core. Use the hottest core instead of showing nothing.
+            cores = [x for x in (f"{cpu['path']}/temp{i}_input" for i in range(1, 64))
+                     if (_num(x, 1000) or 0) > 0]
+            if cores:
+                src, name = ("max", cores, 1000), "CPU temperature (hottest core)"
+                value = max(_num(x, 1000) for x in cores)
+        add(_sensor("cpu_temp", "CPU TEMP", name, "temp", "°C", 0, 100,
+                    _num_cfg("cpu_temp_alert", 80), src, True, "CPU", big=True,
+                    alert_name="CPU temperature", junk=_temp_suspect(cpu["path"], n, value, "")), [f])
     add(_sensor("cpu_load", "CPU LOAD", "CPU load", "load", "%", 0, 100, 90,
                 ("cpu_load", os.path.join(procd, "stat")), True, "CPU", big=True))
 
@@ -434,7 +443,8 @@ def discover(root="/", nvidia=None, cpu_model=None):
         for i in range(1, 16):
             f = f"{board['path']}/fan{i}_input"
             v = _num(f)
-            if v is not None and v > 0:
+            named = bool(_read(f"{board['path']}/fan{i}_label"))     # Dell lists only fans that exist
+            if v is not None and (v > 0 or named):
                 fan_n += 1
                 raw = _read(f"{board['path']}/fan{i}_label")
                 label = _fan_label(raw, fan_n)
@@ -491,7 +501,7 @@ def discover(root="/", nvidia=None, cpu_model=None):
                         _nice_ceil(max(2000, row["clocks.sm"] * 1.3)), ("nv", idx, "clocks.sm"), False, "GPU"))
 
     # --- everything else the hardware reports ---------------------------------------
-    counts, order = {}, {}
+    counts, order, used_labels = {}, {}, {}
     for c in chips:
         counts[c["name"]] = counts.get(c["name"], 0) + 1
     for c in chips:
@@ -533,6 +543,9 @@ def discover(root="/", nvidia=None, cpu_model=None):
                 label, name = f"{tagged} T{n}", f"{who} temperature {n}"
             else:
                 label, name = f"{tagged} {lab}", f"{who} {lab} temperature"
+            seen_here = used_labels.setdefault((c["path"], "temp", lab.lower()), n)
+            if not plain and seen_here != n:                       # several sensors share one label
+                name += f" (sensor {n})"
             group = "Storage" if drive else {"GPU": "GPU", "iGPU": "GPU", "CPU": "CPU"}.get(short, "Board")
             add(_sensor(f"{tag}_{_slug(lab or f'temp{n}')}", screen_label(label), name, "temp", "°C",
                         0, top, round(red), ("file", f, 1000), drive and (composite or n == 1), group,
@@ -547,7 +560,8 @@ def discover(root="/", nvidia=None, cpu_model=None):
             top = _nice_ceil(max(_num(f"{path}/fan{n}_max") or 2500, v * 1.3))
             add(_sensor(f"{tag}_{_slug(lab or f'fan{n}')}",
                         screen_label(f"{tagged} FAN{n}" if plain else f"{tagged} {lab}"),
-                        f"{who} fan {n}" if plain else f"{who} {lab} fan", "fan", "RPM", 0, top,
+                        f"{who} fan {n}" if plain else
+                        (f"{who} {lab}" if lab.lower().endswith("fan") else f"{who} {lab} fan"), "fan", "RPM", 0, top,
                         round(top * 0.88), ("file", f, 1), v > 0, "Fans", scale=1000 if top >= 2000 else None),
                 [f])
         for n in range(0, 40):
@@ -689,6 +703,9 @@ class Sensors:
         kind = src[0]
         if kind == "file":
             return _num(src[1], src[2])
+        if kind == "max":                                   # the hottest of several sensors
+            vals = [v for v in (_num(f, src[2]) for f in src[1]) if v is not None]
+            return max(vals) if vals else None
         if kind == "nv":
             return nv.get(src[1], {}).get(src[2])
         if kind == "nv_vram":
@@ -3307,6 +3324,8 @@ class SensorsWindow(Gtk.Window):
         src = s["src"]
         if src[0] == "file":
             return "/".join(src[1].split("/")[-2:])
+        if src[0] == "max":
+            return f"hottest of {len(src[1])} sensors in " + src[1][0].split("/")[-2]
         if src[0] in ("nv", "nv_vram"):
             return f"nvidia-smi, card {src[1]}"
         return {"cpu_load": "/proc/stat", "ram": "/proc/meminfo", "swap": "/proc/meminfo",

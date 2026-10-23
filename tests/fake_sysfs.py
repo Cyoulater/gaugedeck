@@ -130,3 +130,22 @@ def build_dell(root):
         "fan4_input": 1520, "fan4_label": "Power Supply Fan", "fan5_input": 900, "fan5_label": "Chipset Fan"})
     _chip(root, 2, "nvme", {"temp1_input": 38850, "temp1_label": "Composite", "temp1_max": 83850},
           {"dir": "pci0000:00/nvme0", "files": {"model": "KINGSTON SA2000M81000G"}})
+
+
+def build_latitude_e6410(root):
+    """'mini tank': a Dell Latitude E6410 (Core i5 M 540, 2010) as `gaugedeck --sensors` found it on
+    the real machine. The processor has no whole-CPU reading (temp1 gives nothing), only one per core;
+    the Dell fan is stopped because the laptop is cool; three Dell sensors are all labeled 'Other'."""
+    _w(root, "proc/stat", "cpu  1000 0 500 8000 100 0 0 0 0 0")
+    _w(root, "proc/meminfo", "MemTotal:        8000000 kB\nMemAvailable:    5400000 kB\n"
+                             "SwapTotal:       2000000 kB\nSwapFree:        2000000 kB")
+    _w(root, "proc/cpuinfo", "model name\t: Intel(R) Core(TM) i5 CPU M 540 @ 2.53GHz")
+    _w(root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 2211000)
+    _chip(root, 1, "BAT0", {"in0_input": 12118})
+    _chip(root, 2, "dell_smm", {
+        "temp1_input": 54000, "temp1_label": "CPU", "temp2_input": 36000, "temp2_label": "SODIMM",
+        "temp3_input": 38000, "temp3_label": "Other", "temp4_input": 56000, "temp4_label": "Other",
+        "temp5_input": 48000, "temp5_label": "Other", "fan1_input": 0, "fan1_label": "Processor Fan"})
+    _chip(root, 3, "coretemp", {
+        "temp1_input": "", "temp1_label": "Physical id 0",          # no reading on this processor
+        "temp2_input": 59000, "temp2_label": "Core 0", "temp4_input": 56000, "temp4_label": "Core 2"})

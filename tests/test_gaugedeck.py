@@ -602,6 +602,70 @@ class DellTests(unittest.TestCase):
         self.assertIn("KINGSTON", self.by["nvme_composite"]["name"])
 
 
+
+class LatitudeTests(unittest.TestCase):
+    """'mini tank', a Dell Latitude E6410 with a Core i5 M 540: checked against its real --sensors list."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = tempfile.mkdtemp(prefix="gaugedeck-e6410-")
+        fake_sysfs.build_latitude_e6410(root)
+        cls.cat = gd.discover(root, nvidia={})
+        cls.by = {s["key"]: s for s in cls.cat}
+
+    def test_the_default_deck_has_the_four_gauges_that_make_sense(self):
+        reg = gd.Registry(self.cat, os.path.join(_TMP, "e6410.json"))
+        self.assertEqual([g["key"] for g in reg.enabled()], ["cpu_temp", "cpu_load", "fan1", "ram"])
+
+    def test_a_processor_with_no_whole_cpu_reading_uses_the_hottest_core(self):
+        cpu = self.by["cpu_temp"]
+        self.assertEqual(cpu["junk"], "")
+        self.assertTrue(cpu["default"])
+        self.assertEqual(cpu["src"][0], "max")
+        self.assertIn("hottest core", cpu["name"])
+        self.assertEqual(gd.Sensors(self.cat).read_all(["cpu_temp"])["cpu_temp"], 59.0)
+
+    def test_the_hottest_core_follows_the_cores(self):
+        sensors = gd.Sensors(self.cat)
+        files = self.by["cpu_temp"]["src"][1]
+        with open(files[-1], "w") as f:                  # core 2 gets hotter than core 0
+            f.write("71000\n")
+        self.assertEqual(sensors.read_all(["cpu_temp"])["cpu_temp"], 71.0)
+
+    def test_each_core_is_still_listed_on_its_own(self):
+        self.assertFalse(self.by["coretemp_core_0"]["default"])
+        self.assertFalse(self.by["coretemp_core_2"]["default"])
+
+    def test_a_dell_fan_that_is_stopped_because_it_is_cool_is_still_shown(self):
+        fan = self.by["fan1"]
+        self.assertTrue(fan["default"])
+        self.assertEqual((fan["label"], fan["name"]), ("CPU FAN", "Processor Fan speed"))
+
+    def test_that_stopped_fan_does_not_raise_a_false_alarm_but_does_if_it_dies_later(self):
+        sent = []
+        self.addCleanup(setattr, gd, "REG", gd.REG)
+        gd.REG = gd.Registry(self.cat, os.path.join(_TMP, "e6410-alerts.json"))
+        gd.play_alarm = lambda: None
+        gd.CFG["alerts"] = "on"
+        alerts = gd.Alerts(lambda k, t, b, u: sent.append(t), lambda k: "CPU FAN")
+        alerts.hold = 2
+        for _ in range(6):
+            alerts.update({"fan1": 0}, {"fan1"})
+        self.assertEqual(sent, [])
+        alerts.update({"fan1": 2200}, {"fan1"})
+        for _ in range(4):
+            alerts.update({"fan1": 0}, {"fan1"})
+        self.assertEqual(sent, ["CPU FAN stopped"])
+
+    def test_sensors_that_share_a_label_get_their_own_numbers(self):
+        names = [self.by[k]["name"] for k in ("dell_smm_other", "dell_smm_other_2", "dell_smm_other_3")]
+        self.assertEqual(len(set(names)), 3)
+        self.assertIn("(sensor 4)", names[1])
+
+    def test_no_name_says_fan_twice(self):
+        self.assertFalse([s["name"] for s in self.cat if "fan fan" in s["name"].lower()])
+
+
 class OldSettingsTests(unittest.TestCase):
     """Settings files written by older versions keep working."""
 
