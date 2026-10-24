@@ -17,9 +17,17 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/gaugedeck|" "$DIR/io.github.cyoulater.Gaug
 rm -f "$HOME/.local/share/applications/gaugedeck.desktop" "$HOME/.local/share/icons/hicolor/scalable/apps/gaugedeck.svg"
 
 # optional: custom title, e.g.  ./install.sh "MY RIG"
+# Only the title changes: any other settings already in the config file are kept.
 if [ -n "$1" ]; then
-    mkdir -p "$HOME/.config/gaugedeck"
-    printf 'title=%s\nscale=0.6\n' "$1" > "$HOME/.config/gaugedeck/config"
+    CFG_DIR="$HOME/.config/gaugedeck"
+    mkdir -p "$CFG_DIR"
+    if [ -f "$CFG_DIR/config" ]; then
+        grep -v '^title=' "$CFG_DIR/config" > "$CFG_DIR/config.new" || true
+        printf 'title=%s\n' "$1" >> "$CFG_DIR/config.new"
+        mv "$CFG_DIR/config.new" "$CFG_DIR/config"
+    else
+        printf 'title=%s\nscale=0.6\n' "$1" > "$CFG_DIR/config"
+    fi
 fi
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
