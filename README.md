@@ -1,12 +1,12 @@
 # GaugeDeck
 
-**[Download for Linux](#download-and-install)**
+**[Download for Linux](#download-for-linux) · [Download for Windows](#windows)**
 
 https://github.com/Cyoulater/gaugedeck
 
 ![GaugeDeck](screenshot.png)
 
-Car-style dashboard gauges for your Linux PC: CPU, GPU, fans, drives, RAM, board and any
+Car-style dashboard gauges for your Linux or Windows PC: CPU, GPU, fans, drives, RAM, board and any
 other sensor it finds. Restyle them (colors, glow, shapes, your own pictures), pop each one into
 its own window, pin them to the dock, or keep a slim strip of readings in view.
 
@@ -14,7 +14,7 @@ Built as a native GTK 4 / Wayland app, so it works on current GNOME desktops
 (Ubuntu 25.10 / 26.04 and later) where desktop widgets like Conky freeze or
 fail to draw.
 
-## Download and install
+## Download for Linux
 **Easiest (any Linux):** open a terminal and paste
 
     curl -fsSL https://raw.githubusercontent.com/Cyoulater/gaugedeck/main/get.sh | sh
@@ -35,6 +35,29 @@ and choose "Pin to Dash" to keep it there. Close it with the X.
 
 To set the title shown under the gauges, add it to the end:
 `... | sh -s -- "MY RIG NAME"` or `sh install.sh "MY RIG NAME"`.
+
+## Windows
+For Windows 10 and 11. Download
+**[GaugeDeck-Setup.exe](https://github.com/Cyoulater/gaugedeck/releases/latest/download/GaugeDeck-Setup.exe)**
+and open it. No administrator password is needed. The installer isn't signed yet, so Windows may
+say "Windows protected your PC": click **More info**, then **Run anyway**. Prefer no installer?
+Unzip [GaugeDeck-windows.zip](https://github.com/Cyoulater/gaugedeck/releases/latest/download/GaugeDeck-windows.zip)
+anywhere and run `GaugeDeck.exe`.
+
+On its own, GaugeDeck for Windows shows CPU load, memory, disk space and NVIDIA cards.
+**For temperatures and fans**, Windows needs a helper, because it doesn't let ordinary apps read
+those sensors:
+1. Download [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases)
+   (free), unzip it and run `LibreHardwareMonitor.exe` as administrator.
+2. In its menu choose **Options**, then **Remote Web Server**, then **Run**. Also tick
+   **Options**, **Run On Windows Startup** so it is always there.
+3. Close and reopen GaugeDeck. CPU and GPU temperature, fans, board, drives and the rest appear.
+
+Differences on Windows: alerts sound the alarm and flash the gauge but don't show a pop-up yet,
+and "Pin to dock" puts a shortcut in the Start menu (GaugeDeck folder) that you can right-click
+and pin to the taskbar. Settings live in `C:\Users\<you>\.config\gaugedeck\`. If
+LibreHardwareMonitor's web server uses another port, set `lhm_url=http://localhost:PORT/data.json`
+in the `config` file there. To uninstall, use Settings, Apps.
 
 ## Using it
 - **Right-click a gauge** to pop it out into its own window, change just that gauge, or pin it to
