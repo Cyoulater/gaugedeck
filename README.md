@@ -1,10 +1,12 @@
 # GaugeDeck
 
+**[Download for Linux](#download-for-linux) · [Download for Windows](#windows)**
+
 https://github.com/Cyoulater/gaugedeck
 
 ![GaugeDeck](screenshot.png)
 
-Car-style dashboard gauges for your Linux PC: CPU, GPU, fans, drives, RAM, board and any
+Car-style dashboard gauges for your Linux or Windows PC: CPU, GPU, fans, drives, RAM, board and any
 other sensor it finds. Restyle them (colors, glow, shapes, your own pictures), pop each one into
 its own window, pin them to the dock, or keep a slim strip of readings in view.
 
@@ -12,10 +14,50 @@ Built as a native GTK 4 / Wayland app, so it works on current GNOME desktops
 (Ubuntu 25.10 / 26.04 and later) where desktop widgets like Conky freeze or
 fail to draw.
 
-## Install
-    sh install.sh                # or: sh install.sh "MY RIG NAME"   (sets the title shown under the gauges)
+## Download for Linux
+**Easiest (any Linux):** open a terminal and paste
+
+    curl -fsSL https://raw.githubusercontent.com/Cyoulater/gaugedeck/main/get.sh | sh
+
+It installs what GaugeDeck needs (asks for your password once) and adds it to
+your app menu.
+
+**Or download a package** and double-click it to install with your software center:
+
+| Your Linux | Download |
+|---|---|
+| Ubuntu, Debian, Linux Mint, Pop!_OS, Zorin | [gaugedeck.deb](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.deb) |
+| Fedora | [gaugedeck.rpm](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.rpm) |
+| Anything else | [gaugedeck.tar.gz](https://github.com/Cyoulater/gaugedeck/releases/latest/download/gaugedeck.tar.gz), unpack it, then run `sh install.sh` |
+
 Then open **GaugeDeck** from your app menu. Right-click it in the dock
 and choose "Pin to Dash" to keep it there. Close it with the X.
+
+To set the title shown under the gauges, add it to the end:
+`... | sh -s -- "MY RIG NAME"` or `sh install.sh "MY RIG NAME"`.
+
+## Windows
+For Windows 10 and 11. Download
+**[GaugeDeck-Setup.exe](https://github.com/Cyoulater/gaugedeck/releases/latest/download/GaugeDeck-Setup.exe)**
+and open it. No administrator password is needed. The installer isn't signed yet, so Windows may
+say "Windows protected your PC": click **More info**, then **Run anyway**. Prefer no installer?
+Unzip [GaugeDeck-windows.zip](https://github.com/Cyoulater/gaugedeck/releases/latest/download/GaugeDeck-windows.zip)
+anywhere and run `GaugeDeck.exe`.
+
+On its own, GaugeDeck for Windows shows CPU load, memory, disk space and NVIDIA cards.
+**For temperatures and fans**, Windows needs a helper, because it doesn't let ordinary apps read
+those sensors:
+1. Download [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases)
+   (free), unzip it and run `LibreHardwareMonitor.exe` as administrator.
+2. In its menu choose **Options**, then **Remote Web Server**, then **Run**. Also tick
+   **Options**, **Run On Windows Startup** so it is always there.
+3. Close and reopen GaugeDeck. CPU and GPU temperature, fans, board, drives and the rest appear.
+
+Differences on Windows: alerts sound the alarm and flash the gauge but don't show a pop-up yet,
+and "Pin to dock" puts a shortcut in the Start menu (GaugeDeck folder) that you can right-click
+and pin to the taskbar. Settings live in `C:\Users\<you>\.config\gaugedeck\`. If
+LibreHardwareMonitor's web server uses another port, set `lhm_url=http://localhost:PORT/data.json`
+in the `config` file there. To uninstall, use Settings, Apps.
 
 ## Using it
 - **Right-click a gauge** to pop it out into its own window, change just that gauge, or pin it to
@@ -143,8 +185,13 @@ through `nvidia-smi` at most every 3 seconds.
     python3 -m unittest discover -s tests -v
 
 ## Uninstall
-    sh uninstall.sh
-Removes the program, the app-menu entry, every launcher and icon made by pinning a gauge or the strip
+If you installed the .deb or .rpm, remove "GaugeDeck" in your software center
+(or `sudo apt remove gaugedeck` / `sudo dnf remove gaugedeck`).
+Otherwise paste
+
+    curl -fsSL https://raw.githubusercontent.com/Cyoulater/gaugedeck/main/uninstall.sh | sh
+
+This removes the program, the app-menu entry, every launcher and icon made by pinning a gauge or the strip
 (and takes them off the dock), and `~/.config/gaugedeck`. Your own pictures are never touched.
 
 ## License
