@@ -48,7 +48,7 @@ except (ImportError, ValueError):
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 APP_NAME = "GaugeDeck"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_ID = "io.github.cyoulater.GaugeDeck"
 CONFIG_DIR = os.environ.get("GAUGEDECK_CONFIG_DIR") or os.path.expanduser("~/.config/gaugedeck")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
