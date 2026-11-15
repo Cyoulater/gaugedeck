@@ -48,7 +48,7 @@ except (ImportError, ValueError):
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 APP_NAME = "GaugeDeck"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_ID = "io.github.cyoulater.GaugeDeck"
 CONFIG_DIR = os.environ.get("GAUGEDECK_CONFIG_DIR") or os.path.expanduser("~/.config/gaugedeck")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
@@ -2297,6 +2297,13 @@ def desktop_id_for(mode, key=None):
     return f"{APP_ID}.desktop"
 
 
+def deck_has_launcher():
+    """True when this system has a launcher file for the deck, so it can be pinned to a dock.
+    Gio.DesktopAppInfo only exists on Linux; without this check the main menu failed to open on Windows."""
+    info = getattr(Gio, "DesktopAppInfo", None)
+    return bool(info and info.new(desktop_id_for("deck")))
+
+
 def _apps_dir():
     return os.path.join(GLib.get_user_data_dir(), "applications")
 
@@ -2734,7 +2741,7 @@ class DeckWindow(BaseWindow):
             sec.append("Bring all gauges back", "win.recall")
         m.append_section(None, sec)
         sec2 = Gio.Menu()
-        if Gio.DesktopAppInfo.new(desktop_id_for("deck")):
+        if deck_has_launcher():
             sec2.append("Unpin from dock" if is_pinned(desktop_id_for("deck")) else "Pin to dock", "win.pin-deck")
         sec2.append("About GaugeDeck", "app.about")
         m.append_section(None, sec2)

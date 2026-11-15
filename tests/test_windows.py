@@ -137,5 +137,27 @@ class DiscoverTests(unittest.TestCase):
         self.assertTrue(0 < vals["disk_root"] <= 100)
 
 
+class MainMenuTests(unittest.TestCase):
+    """The deck's menu button did nothing on Windows because Gio.DesktopAppInfo does not exist there."""
+
+    def test_no_desktop_app_info_means_no_launcher_and_no_crash(self):
+        import types
+        real = gd.Gio
+        gd.Gio = types.SimpleNamespace()
+        try:
+            self.assertFalse(gd.deck_has_launcher())
+        finally:
+            gd.Gio = real
+
+    def test_launcher_found_when_the_desktop_file_exists(self):
+        import types
+        real = gd.Gio
+        gd.Gio = types.SimpleNamespace(DesktopAppInfo=types.SimpleNamespace(new=lambda did: object()))
+        try:
+            self.assertTrue(gd.deck_has_launcher())
+        finally:
+            gd.Gio = real
+
+
 if __name__ == "__main__":
     unittest.main()
