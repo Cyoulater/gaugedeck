@@ -1336,6 +1336,9 @@ def save_win_state(name, **kw):
 
 
 # ---------------------------------------------------------------- the sensor list
+if sys.platform == "win32":                # Windows has no /sys or /proc: swap in its own sensor readers
+    import gaugedeck_windows
+    gaugedeck_windows.install(sys.modules[__name__])
 # GAUGEDECK_ROOT points the scanner at a pretend computer's folders (used only for testing)
 CATALOG = demo_catalog() if DEMO else discover(os.environ.get("GAUGEDECK_ROOT") or "/")
 REG = Registry(CATALOG)
