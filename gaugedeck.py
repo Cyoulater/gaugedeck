@@ -2006,31 +2006,82 @@ def draw_gauge(cr, x, y, r, g, v, look, label=None, alarm=False, blink=False, hi
 
 
 BASE_W = 540
+SMALL_R, BIG_R = 80, 110            # dial half-sizes on the deck
+SMALL_STEP, BIG_STEP = 170, 240     # distance between dial centers in a row
+DECK_EDGE = 15                      # room on the left and right of the rows
+MAX_SPREAD = 1.35                   # how far apart dials may move when the window has room to spare
+MAX_ROW_GAP = 45                    # extra room between rows, at most
 
 
-def _row_xs(n, per):
-    full = {2: [150, 390], 3: [100, 270, 440]}[per]
-    if n == per:
-        return full
-    step = full[1] - full[0]
-    start = BASE_W / 2.0 - step * (n - 1) / 2.0
+def _row_xs(n, step, bw):
+    """Centers for n dials in a row, centered in a deck that is bw wide."""
+    start = bw / 2.0 - step * (n - 1) / 2.0
     return [start + step * i for i in range(n)]
 
 
-def deck_layout(gauges):
-    """Rows of dials: big ones two to a row, small ones three to a row.
-    Returns ([(gauge, x, y, r), ...], height)."""
+def _grid_width(gauges, cols):
+    """How wide the deck is with cols small dials to a row (big dials always fit at least one)."""
+    need = SMALL_STEP * cols
+    if any(g["big"] for g in gauges):
+        need = max(need, BIG_STEP)
+    return need + 2 * DECK_EDGE
+
+
+def _grid(gauges, cols, spread=1.0, row_gap=0.0):
+    """Rows of dials: big ones first, then small ones, cols small dials to a row and as many
+    big ones as fit in the same width. spread pulls the dials in a row further apart and row_gap
+    adds room between rows. Returns ([(gauge, x, y, r), ...], width, height)."""
+    inner = _grid_width(gauges, cols) - 2 * DECK_EDGE
+    bw = inner * spread + 2 * DECK_EDGE
+    big_cols = max(1, int(inner // BIG_STEP))
     placed, y, last_r = [], 0, None
-    for items, per, r in (([g for g in gauges if g["big"]], 2, 110),
-                          ([g for g in gauges if not g["big"]], 3, 80)):
+    for items, per, r, step in (([g for g in gauges if g["big"]], big_cols, BIG_R, BIG_STEP),
+                                ([g for g in gauges if not g["big"]], cols, SMALL_R, SMALL_STEP)):
         for i in range(0, len(items), per):
             row = items[i:i + per]
-            y = 40 + r if last_r is None else y + last_r + 20 + r
+            y = 40 + row_gap + r if last_r is None else y + last_r + 20 + row_gap + r
             last_r = r
-            for g, x in zip(row, _row_xs(len(row), per)):
+            for g, x in zip(row, _row_xs(len(row), step * spread, bw)):
                 placed.append((g, x, y, r))
-    height = 200 if last_r is None else y + last_r + 70
+    height = 200 if last_r is None else y + last_r + 70 + row_gap
+    return placed, bw, height
+
+
+def _row_count(gauges, cols):
+    big = sum(1 for g in gauges if g["big"])
+    big_cols = max(1, int((_grid_width(gauges, cols) - 2 * DECK_EDGE) // BIG_STEP))
+    return -(-big // big_cols) + -(-(len(gauges) - big) // cols)
+
+
+def deck_layout(gauges):
+    """The deck at its natural shape: big dials two to a row, small ones three to a row.
+    Returns ([(gauge, x, y, r), ...], height); the width is BASE_W."""
+    placed, _bw, height = _grid(gauges, 3)
     return placed, height
+
+
+def deck_layout_for(gauges, w, h):
+    """The deck laid out for a window w x h pixels: picks how many dials go in a row so they come
+    out as big as the window allows, then spreads them out over any room that is left, so a wide
+    window gets wide rows instead of one narrow column in the middle.
+    Returns ([(gauge, x, y, r), ...], width, height) in deck units."""
+    if not gauges or w <= 0 or h <= 0:
+        placed, height = deck_layout(gauges)
+        return placed, BASE_W, height
+    small = sum(1 for g in gauges if not g["big"])
+    big = len(gauges) - small
+    most = max(3, small, -(-big * BIG_STEP // SMALL_STEP))
+    best = None
+    for cols in range(1, most + 1):
+        _p, bw, bh = _grid(gauges, cols)
+        s = min(w / bw, h / bh)
+        if best is None or s > best[0] + 1e-9:       # ties keep the narrower deck
+            best = (s, cols, bw, bh)
+    s, cols, bw, bh = best
+    spread = max(1.0, min(MAX_SPREAD, ((w / s) - 2 * DECK_EDGE) / (bw - 2 * DECK_EDGE)))
+    rows = max(1, _row_count(gauges, cols))
+    row_gap = max(0.0, min(MAX_ROW_GAP, ((h / s) - bh) / (rows + 1)))
+    return _grid(gauges, cols, spread, row_gap)
 
 
 def _fit(w, h, bw, bh):
@@ -2038,17 +2089,18 @@ def _fit(w, h, bw, bh):
     return s, (w - bw * s) / 2.0, (h - bh * s) / 2.0
 
 
-def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title, history=None, dpi=1):
+def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title, history=None, dpi=1,
+              bw=BASE_W):
     look0 = theme.look(None)
     _draw_background(cr, w, h, look0)
-    s, ox, oy = _fit(w, h, BASE_W, bh)
+    s, ox, oy = _fit(w, h, bw, bh)
     cr.translate(ox, oy)
     cr.scale(s, s)
     if not layout:
         cr.select_font_face(FONTS[look0.s["font"]], 0, 1)
         cr.set_font_size(22)
         cr.set_source_rgb(*look0.c["dim"])
-        _centered(cr, "All gauges are in their own windows", BASE_W / 2, bh / 2)
+        _centered(cr, "All gauges are in their own windows", bw / 2, bh / 2)
     for g, x, y, r in layout:
         key = g["key"]
         on = key in alarms or (key + "_stop") in alarms
@@ -2057,7 +2109,7 @@ def draw_deck(cr, w, h, layout, bh, values, labels, theme, alarms, blink, title,
     cr.select_font_face(TITLE_FONTS[look0.s["font"]], 0, 1)
     cr.set_font_size(30)
     cr.set_source_rgb(*look0.c["red"])
-    _centered(cr, (theme.title or TITLE).upper(), BASE_W / 2, bh - 35)
+    _centered(cr, (theme.title or TITLE).upper(), bw / 2, bh - 35)
 
 
 def draw_solo(cr, w, h, g, v, look, label, alarm, blink, hist=None, dpi=1):
@@ -2134,9 +2186,9 @@ def draw_strip(cr, w, h, gauges, values, labels, theme, alarms, blink, vertical)
             cr.fill()
 
 
-def gauge_at(layout, px, py, w, h, bh):
+def gauge_at(layout, px, py, w, h, bh, bw=BASE_W):
     """The gauge under a click at (px, py) in window pixels, or None."""
-    s, ox, oy = _fit(w, h, BASE_W, bh)
+    s, ox, oy = _fit(w, h, bw, bh)
     x, y = (px - ox) / s, (py - oy) / s
     for g, gx, gy, r in layout:
         if abs(x - gx) <= r * 1.05 and abs(y - gy) <= r * 1.05:
@@ -2619,8 +2671,8 @@ class DeckWindow(BaseWindow):
         self.pending = {}          # asked to pop out, not up yet
         self.area.set_tooltip_text("Right-click a gauge to move it into its own window")
         self._layout_cache = None
-        placed, bh = self.layout()
-        self.set_default_size(int(BASE_W * SCALE), int(bh * SCALE))
+        self._layout_size = None
+        self.set_default_size(*self.starting_size())
 
         header = Gtk.HeaderBar()
         self.menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
@@ -2659,18 +2711,33 @@ class DeckWindow(BaseWindow):
     def shown_keys(self):
         return {g["key"] for g in enabled_gauges()} - self.popped - set(self.pending)
 
-    def layout(self):
-        shown = [g for g in enabled_gauges() if g["key"] in self.shown_keys()]
-        self._layout_cache = deck_layout(shown)
+    def shown_gauges(self):
+        keys = self.shown_keys()
+        return [g for g in enabled_gauges() if g["key"] in keys]
+
+    def starting_size(self):
+        """A first window size: the natural deck, widened into more columns when many gauges are
+        shown so the window doesn't open as one tall column."""
+        shown = self.shown_gauges()
+        if len(shown) <= 8:
+            _placed, bh = deck_layout(shown)
+            return int(BASE_W * SCALE), int(bh * SCALE)
+        _placed, bw, bh = deck_layout_for(shown, 1600, 1000)
+        return int(bw * SCALE), int(bh * SCALE)
+
+    def layout(self, w=None, h=None):
+        """(placed, deck width, deck height) for the drawing area, worked out again when its size
+        or the shown gauges change."""
+        w = w or self.area.get_width()
+        h = h or self.area.get_height()
+        if self._layout_cache is None or self._layout_size != (w, h):
+            self._layout_cache = deck_layout_for(self.shown_gauges(), w, h)
+            self._layout_size = (w, h)
         return self._layout_cache
 
     def _relayout(self):
-        old_h = self._layout_cache[1] if self._layout_cache else None
-        placed, bh = self.layout()
+        self._layout_cache = None
         self.refresh_want()
-        if old_h and old_h != bh and not self.is_maximized() and not self.is_fullscreen():
-            w = max(self.get_width(), 200)
-            self.set_default_size(w, int(w * bh / BASE_W) + 46)
         self.area.queue_draw()
 
     def _solo_up(self, key):
@@ -2748,8 +2815,9 @@ class DeckWindow(BaseWindow):
         button.set_menu_model(m)
 
     def _right_click(self, gesture, n, x, y):
-        key = gauge_at(self._layout_cache[0], x, y, self.area.get_width(), self.area.get_height(),
-                       self._layout_cache[1])
+        w, h = self.area.get_width(), self.area.get_height()
+        placed, bw, bh = self.layout(w, h)
+        key = gauge_at(placed, x, y, w, h, bh, bw)
         m = Gio.Menu()
         if key:
             name = self.app.display_label(key)
@@ -2766,10 +2834,10 @@ class DeckWindow(BaseWindow):
         self.show_menu(m, x, y)
 
     def _draw(self, _area, cr, w, h):
-        placed, bh = self._layout_cache
+        placed, bw, bh = self.layout(w, h)
         draw_deck(cr, w, h, placed, bh, self.values, {}, self.app.theme,
                   self.alerts.active | self.test_flash, self.blink, TITLE, self.history,
-                  self.area.get_scale_factor())
+                  self.area.get_scale_factor(), bw)
 
     def _on_close(self, win):
         self.peers.close()
