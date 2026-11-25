@@ -65,6 +65,75 @@ class LayoutTests(unittest.TestCase):
         self.assertIsNone(gd.gauge_at(placed, 270 * s, 150 * s, 540, bh * s, bh))
 
 
+class SpreadOutDeckTests(unittest.TestCase):
+    """The deck window lays its gauges out for its own shape, so many gauges fill a wide window."""
+
+    @staticmethod
+    def scale(bw, bh, w, h):
+        return min(w / bw, h / bh)
+
+    @staticmethod
+    def no_overlap(test, placed):
+        for i, (_a, x1, y1, r1) in enumerate(placed):
+            for _b, x2, y2, r2 in placed[i + 1:]:
+                test.assertTrue(abs(x1 - x2) >= r1 + r2 or abs(y1 - y2) >= r1 + r2, (x1, y1, x2, y2))
+
+    def test_the_default_deck_in_its_default_window_looks_as_before(self):
+        _p, bh = gd.deck_layout(ORIGINAL_EIGHT)
+        placed, bw, height = gd.deck_layout_for(ORIGINAL_EIGHT, 540, bh)
+        self.assertEqual((bw, height), (540, 690))
+        self.assertEqual(placed, gd.deck_layout(ORIGINAL_EIGHT)[0])
+
+    def test_many_gauges_in_a_wide_window_use_wide_rows(self):
+        gauges = [make_gauge(f"s{i}") for i in range(24)]
+        placed, bw, bh = gd.deck_layout_for(gauges, 1920, 1080)
+        rows = len({y for _g, _x, y, _r in placed})
+        self.assertGreaterEqual(len(placed) / rows, 6)            # not three to a row any more
+        _p, old_h = gd.deck_layout(gauges)
+        self.assertGreater(self.scale(bw, bh, 1920, 1080), 1.8 * self.scale(gd.BASE_W, old_h, 1920, 1080))
+        self.no_overlap(self, placed)
+
+    def test_a_tall_narrow_window_stacks_them(self):
+        gauges = [make_gauge(f"s{i}") for i in range(6)]
+        placed, bw, bh = gd.deck_layout_for(gauges, 200, 1200)
+        self.assertLessEqual(len([1 for _g, _x, y, _r in placed if y == placed[0][2]]), 2)
+
+    def test_big_dials_always_fit_inside_the_deck(self):
+        gauges = ORIGINAL_EIGHT[:2] + [make_gauge(f"s{i}") for i in range(3)]
+        for w, h in ((150, 1500), (540, 690), (2500, 400)):
+            placed, bw, bh = gd.deck_layout_for(gauges, w, h)
+            for _g, x, y, r in placed:
+                self.assertGreaterEqual(x - r, 0, (w, h))
+                self.assertLessEqual(x + r, bw, (w, h))
+                self.assertLessEqual(y + r, bh, (w, h))
+            self.no_overlap(self, placed)
+
+    def test_spare_room_spreads_the_dials_out(self):
+        gauges = [make_gauge(f"s{i}") for i in range(3)]
+        placed, bw, bh = gd.deck_layout_for(gauges, 1000, 300)
+        step = placed[1][1] - placed[0][1]
+        self.assertGreater(step, gd.SMALL_STEP)
+        self.assertLessEqual(step, gd.SMALL_STEP * gd.MAX_SPREAD + 1e-9)
+
+    def test_clicks_and_drawing_use_the_spread_out_layout(self):
+        import cairo
+        gauges = [make_gauge(f"s{i}") for i in range(12)]
+        w, h = 1200, 500
+        placed, bw, bh = gd.deck_layout_for(gauges, w, h)
+        s, ox, oy = gd._fit(w, h, bw, bh)
+        for g, x, y, _r in placed:
+            self.assertEqual(gd.gauge_at(placed, ox + x * s, oy + y * s, w, h, bh, bw), g["key"])
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        theme = gd.Theme(os.path.join(_TMP, "spread.json"))
+        gd.draw_deck(cairo.Context(surf), w, h, placed, bh, {}, {}, theme, set(), False, "T", {}, 1, bw)
+
+    def test_an_empty_or_unsized_deck_still_lays_out(self):
+        self.assertEqual(gd.deck_layout_for([], 800, 600), ([], gd.BASE_W, 200))
+        placed, bw, _bh = gd.deck_layout_for(ORIGINAL_EIGHT, 0, 0)
+        self.assertEqual(bw, gd.BASE_W)
+        self.assertEqual(len(placed), 8)
+
+
 class ThemeTests(unittest.TestCase):
     def setUp(self):
         self.path = os.path.join(_TMP, "t.json")
